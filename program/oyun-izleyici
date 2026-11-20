@@ -1,0 +1,3954 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Oyun İzleyici — canlı FPS / donanım paneli, oyun geçmişi ve PC karşılaştırma (PySide6 / Qt6).
+
+  Linux  : MangoHud kayıtlarından FPS; /sys ve /proc'tan sensörler (AMD, NVIDIA, Intel).
+  Windows: PresentMon ile FPS; psutil, nvidia-smi ve WMI ile sensörler.
+
+Her PC'nin oturumları kendi klasörüne yazılır; isteğe bağlı bir GitHub deposuyla PC'ler arası
+karşılaştırma yapılabilir. Ayarlar: makine.conf (Linux: ~/.config/oyun-izleyici, Windows: %APPDATA%).
+"""
+
+import os
+import re
+import sys
+import glob
+import time
+import math
+from collections import deque
+
+IS_WIN = sys.platform.startswith("win")
+if IS_WIN:
+    import msvcrt
+    fcntl = None
+    _LOCAL = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    _ROAM = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+else:
+    import fcntl
+    _LOCAL = _ROAM = None
+
+# Kare kayıtları <oyun>_<tarih>.csv: Linux'ta MangoHud (görünmez HUD + autostart_log), Windows'ta PresentMon köprüsü yazar
+MANGOHUD_DIR = os.path.join(_LOCAL, "oyun-izleyici", "canli") if IS_WIN else "/tmp/mangohud_live"
+MANGOHUD_STALE_SEC = 3.0
+LOG_NAME_RE = re.compile(r"^(.+?)_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv$")
+FPS_WINDOW_ROWS = 600  # log_interval=100 ms -> son ~60 sn
+
+# XWayland (xcb) kullanarak çoklu monitörde (HDMI-A-1) kesin konumlandırma ve Her Zaman Üstte desteği sağla
+if not IS_WIN and "QT_QPA_PLATFORM" not in os.environ:
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QRect, QPoint, QSettings
+from PySide6.QtGui import (
+    QPainter, QColor, QPen, QBrush, QFont, QPainterPath, QPolygonF, QAction, QGuiApplication
+)
+from PySide6.QtWidgets import QApplication, QWidget, QMenu
+
+
+def read_int(path, default=0):
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return default
+
+
+def read_str(path, default=""):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+
+# =============================================================================
+# OYUN OTURUM KAYITLARI (SQLite) — her oyun açılışı ayrı bir oturum satırıdır
+# =============================================================================
+DATA_DIR = (os.path.join(_LOCAL, "oyun-izleyici") if IS_WIN
+            else os.path.join(os.path.expanduser("~"), ".local", "share", "oyun-izleyici"))
+INSTALLED_BIN = (os.path.join(DATA_DIR, "app", "oyun_izleyici.pyw") if IS_WIN
+                 else os.path.join(os.path.expanduser("~"), ".local", "bin", "oyun-izleyici"))
+PRESENTMON_EXE = os.path.join(DATA_DIR, "bin", "PresentMon.exe")
+DB_PATH = os.path.join(DATA_DIR, "oyunlar.db")
+BACKUP_DIR = os.path.join(DATA_DIR, "yedekler")
+BACKUP_KEEP = 60               # son 60 yedek tutulur (günlük + elle alınanlar)
+MIN_SESSION_SEC = 120          # 2 dakikadan kısa açılışlar (launcher, menü) kaydedilmez
+CHECKPOINT_SEC = 60            # oyun sürerken her dakika ara kayıt (çökme / elektrik kesintisine karşı)
+ORPHAN_STALE_SEC = 15          # bu kadar süredir yazılmayan log "bitmiş" sayılır
+IGNORED_PROGRAMS = {
+    "VKCUBE", "VULKANINFO", "STEAM", "STEAMWEBHELPER", "GAMESCOPE", "PROTONTRICKS",
+    "WINECFG", "EXPLORER", "SERVICES", "WINEBOOT", "VKMARK", "GLXGEARS",
+}
+
+LOG_COLUMNS = ("fps", "frametime", "gpu_temp", "cpu_temp", "gpu_power",
+               "cpu_power", "gpu_vram_used", "gpu_load", "elapsed")
+
+
+KNOWN_GAME_NAMES = {
+    "DOOMTHEDARKAGES": "DOOM THE DARK AGES",
+    "DOOMETHERNAL": "DOOM ETERNAL",
+    "DOOMETERNAL": "DOOM ETERNAL",
+    "CYBERPUNK2077": "CYBERPUNK 2077",
+    "ELDENRING": "ELDEN RING",
+    "BALDURSGATE3": "BALDUR'S GATE 3",
+    "REDDEADREDEMPTION2": "RED DEAD REDEMPTION 2",
+    "THELASTOFUS": "THE LAST OF US",
+    "GHOSTOFTSUSHIMA": "GHOST OF TSUSHIMA",
+    "GODZILLAVSKONG": "GODZILLA VS KONG",
+    "GODOFWAR": "GOD OF WAR",
+    "GODOFWARRAGNAROK": "GOD OF WAR RAGNAROK",
+    "HORIZONZERODAWN": "HORIZON ZERO DAWN",
+    "HORIZONFORBIDDENWEST": "HORIZON FORBIDDEN WEST",
+    "BLACKMYTHWUKONG": "BLACK MYTH WUKONG",
+    "SPACEMARINE2": "SPACE MARINE 2",
+    "ALANWAKE2": "ALAN WAKE 2",
+    "STALKER2": "S.T.A.L.K.E.R. 2",
+    "COUNTERSTRIKE2": "COUNTER-STRIKE 2",
+    "APEXLEGENDS": "APEX LEGENDS",
+    "LEAGUEOFLEGENDS": "LEAGUE OF LEGENDS",
+    "ROCKETLEAGUE": "ROCKET LEAGUE",
+    "PATHOFEXILE": "PATH OF EXILE",
+    "PATHOFEXILE2": "PATH OF EXILE 2",
+    "MONSTERHUNTERWILDS": "MONSTER HUNTER WILDS",
+    "MONSTERHUNTERWORLD": "MONSTER HUNTER WORLD",
+    "KINGDOMCOMEDELIVERANCE2": "KINGDOM COME DELIVERANCE 2",
+}
+
+
+def format_game_title(raw_name):
+    if not raw_name:
+        return ""
+    s = raw_name.strip()
+    if s.lower().endswith(".exe"):
+        s = s[:-4]
+    for suf in ("-Win64-Shipping", "_Win64_Shipping", "-Linux-Shipping"):
+        if s.lower().endswith(suf.lower()):
+            s = s[:-len(suf)]
+    # Alt çizgi ve tireleri boşluğa çevir
+    s = re.sub(r"[_\\-]+", " ", s)
+    # CamelCase / PascalCase kelime sınırlarına boşluk ekle:
+    # 1) BÜYÜK harf dizisinden sonra Büyük+küçük geliyorsa (DOOMThe -> DOOM The)
+    s = re.sub(r"([A-Z]{2,})([A-Z][a-z])", r"\1 \2", s)
+    # 2) küçük harf veya rakamdan sonra Büyük harf geliyorsa (TheDarkAges -> The Dark Ages)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    s = re.sub(r"\s+", " ", s).strip().upper()
+    compact = s.replace(" ", "")
+    return KNOWN_GAME_NAMES.get(compact, s)
+
+
+def game_name_from_log(path):
+    base = os.path.basename(path)
+    m = LOG_NAME_RE.match(base)
+    name = m.group(1) if m else os.path.splitext(base)[0]
+    return format_game_title(name)
+
+
+def start_ts_from_log(path):
+    m = re.search(r"_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.csv$", os.path.basename(path))
+    if m:
+        try:
+            return time.mktime(time.strptime(m.group(1), "%Y-%m-%d_%H-%M-%S"))
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return time.time()
+
+
+def header_columns(line):
+    """MangoHud sütun başlığı satırıysa {sütun: index} döndürür."""
+    cols = [c.strip() for c in line.split(",")]
+    if "fps" in cols and "frametime" in cols:
+        return {c: cols.index(c) for c in LOG_COLUMNS if c in cols}
+    return None
+
+
+def parse_row(line, colmap):
+    parts = line.split(",")
+    if len(parts) <= max(colmap.values()):
+        return None
+    try:
+        rec = {c: float(parts[i]) for c, i in colmap.items()}
+    except ValueError:
+        return None
+    if not (1.0 <= rec["fps"] <= 2000.0):
+        return None
+    return rec
+
+
+def fmt_duration(sec, short=False):
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    m = rem // 60
+    if short:
+        return f"{h} SA {m:02d} DK" if h else f"{m} DK"
+    return f"{h} sa {m:02d} dk" if h else f"{m} dk"
+
+
+def fmt_clock_timer(sec):
+    sec = max(0, int(sec or 0))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def read_system_uptime():
+    if IS_WIN:
+        try:
+            import ctypes
+            return ctypes.windll.kernel32.GetTickCount64() / 1000.0
+        except Exception:
+            return 0.0
+    try:
+        with open("/proc/uptime", "r") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 0.0
+
+
+class _Stat:
+    """Ortalama + maksimum için hafif sayaç (0 = sensör yok, sayılmaz)."""
+    __slots__ = ("s", "n", "mx")
+
+    def __init__(self):
+        self.s = 0.0
+        self.n = 0
+        self.mx = None
+
+    def add(self, v):
+        if v is None or v <= 0:
+            return
+        self.s += v
+        self.n += 1
+        self.mx = v if self.mx is None else max(self.mx, v)
+
+    def avg(self):
+        return self.s / self.n if self.n else None
+
+
+class SessionAccumulator:
+    """Bir oyun oturumunun tüm satırlarını toplayıp menü/yükleme ekranı anomalilerini ayıklayarak özet çıkarır."""
+
+    def __init__(self, log_path):
+        from array import array
+        self.log_file = os.path.basename(log_path)
+        self.game = game_name_from_log(log_path)
+        self.start_ts = start_ts_from_log(log_path)
+        self.fps = array("f")
+        self.active_fps = array("f")   # sadece gerçek 3D oyun yükündeki kareler (menü / yükleme ekranı hariç)
+        self.ft = _Stat()
+        self.active_ft = _Stat()
+        self.last_elapsed = None
+        # MangoHud logundan gelen sensörler
+        self.log_hw = {k: _Stat() for k in ("gpu_temp", "cpu_temp", "gpu_power", "cpu_power", "vram")}
+        # Panelin kendi okumaları (log sütunu boşsa yedek olarak)
+        self.panel_hw = {k: _Stat() for k in ("gpu_temp", "cpu_temp", "gpu_power", "cpu_power", "vram")}
+        self.ac_samples = 0       # priz/pil örnekleri (sadece laptoplarda)
+        self.ac_on = 0
+        self._low_run = []        # şu an süren <15 FPS serisi (yükleme mi takılma mı: seri bitince belli olur)
+        self._low_run_n = 0
+
+    def _flush_low_run(self):
+        if 0 < self._low_run_n < self.LOAD_RUN_ROWS:
+            for lf, lft in self._low_run:
+                self.active_fps.append(lf)
+                self.active_ft.add(lft)
+        self._low_run, self._low_run_n = [], 0
+
+    LOW_FPS_FLOOR = 15.0     # bunun altındaki kareler: tek tek takılma, uzun süre kalırsa yükleme ekranı
+    LOAD_RUN_ROWS = 20       # 100 ms'lik 20 satır = 2 sn: bu kadar süren <15 FPS serisi yükleme ekranıdır
+
+    @staticmethod
+    def drop_load_runs(values):
+        """Sırayla verilen FPS listesinden, >=2 sn süren <15 FPS serilerini (yükleme ekranı) çıkarır.
+        Daha kısa düşüşler gerçek takılmadır: 1% / 0.1% low'a girmeleri gerekir."""
+        out, run = [], []
+        for v in values:
+            if v < SessionAccumulator.LOW_FPS_FLOOR:
+                run.append(v)
+                continue
+            if run and len(run) < SessionAccumulator.LOAD_RUN_ROWS:
+                out.extend(run)
+            run = []
+            out.append(v)
+        if run and len(run) < SessionAccumulator.LOAD_RUN_ROWS:
+            out.extend(run)
+        return out
+
+    @staticmethod
+    def is_gameplay_frame(fps, gpu_power=None, gpu_load=None):
+        """Menüdeki 800-2000 FPS patlamalarını filtreler (düşük FPS'e dokunmaz: takılmalar korunur)."""
+        if fps > 720.0:
+            return False
+        # Ekran kartı boştayken (<38W ve <%25 yük) çok yüksek FPS üretiyorsa 2D menü/intro ekranıdır
+        if fps > 240.0 and gpu_power is not None and 0 < gpu_power < 38.0 and (gpu_load is None or gpu_load < 25.0):
+            return False
+        return True
+
+    def add(self, rec):
+        f = rec["fps"]
+        ft = rec.get("frametime")
+        gw = rec.get("gpu_power")
+        gl = rec.get("gpu_load")
+        self.fps.append(f)
+        self.ft.add(ft)
+        if f < self.LOW_FPS_FLOOR:
+            self._low_run_n += 1
+            if self._low_run_n <= self.LOAD_RUN_ROWS:
+                self._low_run.append((f, ft))
+        else:
+            self._flush_low_run()
+            if self.is_gameplay_frame(f, gw, gl):
+                self.active_fps.append(f)
+                self.active_ft.add(ft)
+        if rec.get("elapsed"):
+            self.last_elapsed = rec["elapsed"]
+        self.log_hw["gpu_temp"].add(rec.get("gpu_temp"))
+        self.log_hw["cpu_temp"].add(rec.get("cpu_temp"))
+        self.log_hw["gpu_power"].add(gw)
+        self.log_hw["cpu_power"].add(rec.get("cpu_power"))
+        v = rec.get("gpu_vram_used")
+        self.log_hw["vram"].add(v * 1024.0 if v else None)  # GB -> MB
+
+    def add_panel_sample(self, t):
+        self.panel_hw["gpu_temp"].add(t.gpu_temp)
+        self.panel_hw["cpu_temp"].add(t.cpu_temp)
+        self.panel_hw["gpu_power"].add(t.gpu_watt)
+        self.panel_hw["cpu_power"].add(t.cpu_watt)
+        self.panel_hw["vram"].add(t.vram_used_mb)
+        if t.on_ac is not None:
+            self.ac_samples += 1
+            self.ac_on += 1 if t.on_ac else 0
+
+    def duration(self):
+        if self.last_elapsed:
+            return self.last_elapsed / 1e9
+        return len(self.fps) * 0.1
+
+    def _hw(self, key):
+        st = self.log_hw[key] if self.log_hw[key].n else self.panel_hw[key]
+        return st.avg(), st.mx
+
+    @staticmethod
+    def filter_menu_outliers(sorted_vals):
+        """Sıralı FPS listesinden menü patlamalarını (medyanın 1.65 katını aşan üst kuyruk) keser.
+        Alt uca dokunmaz: gerçek takılmalar 1% / 0.1% low'da görünmeli."""
+        m = len(sorted_vals)
+        if m < 30:
+            return sorted_vals
+        median = sorted_vals[m // 2]
+        p90 = sorted_vals[int(m * 0.90)]
+        upper_cap = min(720.0, max(median * 1.65, p90 * 1.18))
+        trimmed = [v for v in sorted_vals if v <= upper_cap]
+        return trimmed if len(trimmed) >= max(10, m // 4) else sorted_vals
+
+    def result(self):
+        n_total = len(self.fps)
+        if n_total == 0:
+            return None
+        pending = [lf for lf, _ in self._low_run] if 0 < self._low_run_n < self.LOAD_RUN_ROWS else []
+        active = list(self.active_fps) + pending     # süren kısa düşüş de takılmadır
+        base_pool = active if len(active) >= max(20, n_total // 5) else self.fps
+        vals = self.filter_menu_outliers(sorted(base_pool))
+        n = len(vals)
+        n1 = max(1, n // 100)
+        n01 = max(1, n // 1000)
+        dur = self.duration()
+        gt_avg, gt_max = self._hw("gpu_temp")
+        ct_avg, ct_max = self._hw("cpu_temp")
+        gw_avg, _ = self._hw("gpu_power")
+        cw_avg, _ = self._hw("cpu_power")
+        _, vram_max = self._hw("vram")
+        avg_ft = self.active_ft.avg() if self.active_ft.n >= 20 else self.ft.avg()
+        return {
+            "log_file": self.log_file,
+            "game": self.game,
+            "start_ts": self.start_ts,
+            "end_ts": self.start_ts + dur,
+            "duration_s": dur,
+            "avg_fps": sum(vals) / n,
+            "low1": sum(vals[:n1]) / n1,
+            "low01": sum(vals[:n01]) / n01,
+            "max_fps": vals[-1],
+            "avg_ft": avg_ft,
+            "gpu_temp_avg": gt_avg, "gpu_temp_max": gt_max,
+            "cpu_temp_avg": ct_avg, "cpu_temp_max": ct_max,
+            "gpu_w_avg": gw_avg, "cpu_w_avg": cw_avg,
+            "vram_max_mb": vram_max,
+            "samples": n_total,
+            "ac_ratio": (self.ac_on / self.ac_samples) if self.ac_samples else None,
+        }
+
+    @classmethod
+    def from_file(cls, path):
+        acc = cls(path)
+        colmap = None
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if colmap is None:
+                    colmap = header_columns(line)
+                    continue
+                rec = parse_row(line, colmap)
+                if rec:
+                    acc.add(rec)
+        return acc
+
+
+class SessionStore:
+    """Kalıcı kayıt: ~/.local/share/oyun-izleyici/oyunlar.db (+ günlük yedekler).
+
+    Her satırın bir machine_id'si vardır. Bu PC'nin oturumları burada üretilir; diğer PC'lerinkiler
+    GitHub deposundan gelir ve sadece okunur.
+    """
+
+    SESSION_FIELDS = ("log_file", "game", "start_ts", "end_ts", "duration_s", "avg_fps", "low1",
+                      "low01", "max_fps", "avg_ft", "gpu_temp_avg", "gpu_temp_max", "cpu_temp_avg",
+                      "cpu_temp_max", "gpu_w_avg", "cpu_w_avg", "vram_max_mb", "samples", "ac_ratio")
+    SYNC_FIELDS = SESSION_FIELDS + ("note",)
+
+    def __init__(self, machine_id, path=DB_PATH):
+        import sqlite3
+        self.sqlite3 = sqlite3
+        self.machine_id = machine_id
+        self.path = path
+        self.recovered_from = None
+        self.changed_since_sync = True
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        self.db = self._open_checked()
+        self._init_schema()
+        self.backup_if_needed()
+
+    def _connect(self):
+        db = self.sqlite3.connect(self.path, timeout=10)
+        db.row_factory = self.sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        return db
+
+    def _open_checked(self):
+        """Veritabanı bozuksa kenara alır ve en son yedekten geri yükler."""
+        if os.path.exists(self.path):
+            try:
+                db = self._connect()
+                ok = db.execute("PRAGMA quick_check").fetchone()[0]
+                if ok == "ok":
+                    return db
+                db.close()
+            except self.sqlite3.DatabaseError:
+                pass
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            for suffix in ("", "-wal", "-shm"):
+                if os.path.exists(self.path + suffix):
+                    os.replace(self.path + suffix, f"{self.path}.bozuk-{stamp}{suffix}")
+            backups = self.list_backups()
+            if backups:
+                import shutil
+                shutil.copy2(backups[-1], self.path)
+                self.recovered_from = backups[-1]
+        return self._connect()
+
+    _SESSIONS_DDL = """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            machine_id TEXT NOT NULL,
+            log_file TEXT NOT NULL,
+            game TEXT NOT NULL,
+            start_ts REAL, end_ts REAL, duration_s REAL,
+            finished INTEGER NOT NULL DEFAULT 0,
+            avg_fps REAL, low1 REAL, low01 REAL, max_fps REAL, avg_ft REAL,
+            gpu_temp_avg REAL, gpu_temp_max REAL, cpu_temp_avg REAL, cpu_temp_max REAL,
+            gpu_w_avg REAL, cpu_w_avg REAL, vram_max_mb REAL, samples INTEGER,
+            ac_ratio REAL, note TEXT,
+            UNIQUE(machine_id, log_file)
+        )"""
+
+    def _init_schema(self):
+        ver = self.db.execute("PRAGMA user_version").fetchone()[0]
+        with self.db:
+            if ver == 1:
+                # v1 -> v2: makine kimliği, not ve priz/pil sütunları (eski satırlar bu PC'nindir)
+                self.backup_if_needed(force=True)
+                self.db.execute("ALTER TABLE sessions RENAME TO sessions_v1")
+                self.db.execute(self._SESSIONS_DDL)
+                old_cols = [r[1] for r in self.db.execute("PRAGMA table_info(sessions_v1)")]
+                keep = [c for c in old_cols if c != "id"]
+                self.db.execute(
+                    f"INSERT INTO sessions (machine_id, {', '.join(keep)}) "
+                    f"SELECT ?, {', '.join(keep)} FROM sessions_v1", (self.machine_id,))
+                self.db.execute("DROP TABLE sessions_v1")
+            self.db.execute(self._SESSIONS_DDL)
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_game ON sessions(game)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_machine ON sessions(machine_id)")
+            # Kısa açılışlar / silinen oturumlar (bu PC): tekrar içe aktarılmasın diye
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS ignored_logs (
+                    log_file TEXT PRIMARY KEY, reason TEXT, ts REAL
+                )""")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS machines (
+                    machine_id TEXT PRIMARY KEY, name TEXT, gpu TEXT, cpu TEXT, ram TEXT,
+                    os TEXT, has_battery INTEGER
+                )""")
+            self.db.execute("PRAGMA user_version=2")
+            # Mevcut oturumlardaki birleşik oyun adlarını (ör. DOOMTHEDARKAGES) log dosya adından veya sözlükten düzelt
+            for r in self.db.execute("SELECT id, game, log_file FROM sessions").fetchall():
+                nice = game_name_from_log(r["log_file"]) if r["log_file"] else format_game_title(r["game"])
+                if nice and nice != r["game"]:
+                    self.db.execute("UPDATE sessions SET game=? WHERE id=?", (nice, r["id"]))
+                    self.changed_since_sync = True
+
+    # --- yazma ---
+    def upsert(self, res, finished):
+        cols = ["machine_id"] + list(self.SESSION_FIELDS) + ["finished"]
+        vals = [self.machine_id] + [res.get(c) for c in self.SESSION_FIELDS] + [1 if finished else 0]
+        updates = ", ".join(f"{c}=excluded.{c}" for c in cols if c not in ("machine_id", "log_file"))
+        with self.db:
+            self.db.execute(
+                f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+                f"ON CONFLICT(machine_id, log_file) DO UPDATE SET {updates}", vals)
+        if finished:
+            self.changed_since_sync = True
+        try:
+            self.backup_if_needed(refresh=True)  # bugünün yedeği her kayıttan sonra güncel
+        except Exception as e:
+            print(f"[oyun-izleyici] yedek hatası: {e}", file=sys.stderr)
+
+    def ignore(self, log_file, reason):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO ignored_logs VALUES (?, ?, ?)",
+                            (log_file, reason, time.time()))
+
+    def delete_session(self, session_id):
+        row = self.db.execute("SELECT log_file FROM sessions WHERE id=? AND machine_id=?",
+                              (session_id, self.machine_id)).fetchone()
+        if not row:
+            return False
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            self.db.execute("INSERT OR REPLACE INTO ignored_logs VALUES (?, ?, ?)",
+                            (row["log_file"], "kullanıcı sildi", time.time()))
+        self.changed_since_sync = True
+        self.backup_if_needed(refresh=True)
+        return True
+
+    def set_note(self, session_id, note):
+        with self.db:
+            cur = self.db.execute("UPDATE sessions SET note=? WHERE id=? AND machine_id=?",
+                                  (note.strip() or None, session_id, self.machine_id))
+        self.changed_since_sync = True
+        self.backup_if_needed(refresh=True)
+        return cur.rowcount > 0
+
+    def finish_orphans(self, existing_logs, live_log):
+        """Log dosyası artık olmayan (ör. yeniden başlatma) yarım oturumları son ara kayıtla kapatır."""
+        with self.db:
+            for r in self.db.execute("SELECT id, log_file FROM sessions WHERE finished=0 AND machine_id=?",
+                                     (self.machine_id,)).fetchall():
+                if r["log_file"] != live_log and r["log_file"] not in existing_logs:
+                    self.db.execute("UPDATE sessions SET finished=1 WHERE id=?", (r["id"],))
+                    self.changed_since_sync = True
+
+    def upsert_machine(self, mid, info):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO machines VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (mid, info.get("name") or mid, info.get("gpu"), info.get("cpu"),
+                             info.get("ram"), info.get("os"), 1 if info.get("has_battery") else 0))
+
+    def replace_machine_sessions(self, mid, rows):
+        """Başka bir PC'nin oturumlarını depodaki haliyle değiştirir (tek işlemde)."""
+        cols = ["machine_id"] + list(self.SYNC_FIELDS) + ["finished"]
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE machine_id=?", (mid,))
+            for r in rows:
+                self.db.execute(f"INSERT OR REPLACE INTO sessions ({', '.join(cols)}) "
+                                f"VALUES ({', '.join('?' * len(cols))})",
+                                [mid] + [r.get(c) for c in self.SYNC_FIELDS] + [1])
+
+    def restore_own_sessions(self, rows):
+        """Bu PC'nin depodaki kayıtlarından yerelde olmayanları geri yükler (kurulum sıfırlansa bile)."""
+        cols = ["machine_id"] + list(self.SYNC_FIELDS) + ["finished"]
+        added = 0
+        with self.db:
+            for r in rows:
+                lf = r.get("log_file")
+                if not lf or self.db.execute("SELECT 1 FROM ignored_logs WHERE log_file=?", (lf,)).fetchone():
+                    continue
+                cur = self.db.execute(f"INSERT OR IGNORE INTO sessions ({', '.join(cols)}) "
+                                      f"VALUES ({', '.join('?' * len(cols))})",
+                                      [self.machine_id] + [r.get(c) for c in self.SYNC_FIELDS] + [1])
+                added += cur.rowcount
+        return added
+
+    # --- okuma ---
+    def is_done(self, log_file):
+        r = self.db.execute("SELECT 1 FROM sessions WHERE log_file=? AND machine_id=? AND finished=1 "
+                            "UNION SELECT 1 FROM ignored_logs WHERE log_file=?",
+                            (log_file, self.machine_id, log_file)).fetchone()
+        return r is not None
+
+    def own_finished_sessions(self):
+        return self.db.execute("SELECT * FROM sessions WHERE machine_id=? AND finished=1 ORDER BY start_ts",
+                               (self.machine_id,)).fetchall()
+
+    def machines(self):
+        rows = {r["machine_id"]: dict(r) for r in self.db.execute("SELECT * FROM machines")}
+        for r in self.db.execute("SELECT DISTINCT machine_id FROM sessions"):
+            rows.setdefault(r["machine_id"], {"machine_id": r["machine_id"], "name": r["machine_id"]})
+        rows.setdefault(self.machine_id, {"machine_id": self.machine_id, "name": self.machine_id})
+        return sorted(rows.values(), key=lambda m: (m["machine_id"] != self.machine_id, m["name"] or ""))
+
+    @staticmethod
+    def _where(machine=None, game=None, ac_only=False):
+        conds, args = [], []
+        if machine:
+            conds.append("machine_id=?")
+            args.append(machine)
+        if game:
+            conds.append("game=?")
+            args.append(game)
+        if ac_only:
+            conds.append("(ac_ratio IS NULL OR ac_ratio >= 0.9)")
+        return (" WHERE " + " AND ".join(conds)) if conds else "", args
+
+    def totals(self, machine=None):
+        w, a = self._where(machine)
+        return self.db.execute("SELECT COUNT(DISTINCT game) AS games, COUNT(*) AS sessions, "
+                               f"COALESCE(SUM(duration_s),0) AS secs FROM sessions{w}", a).fetchone()
+
+    def game_totals(self, machine=None, ac_only=False):
+        w, a = self._where(machine, ac_only=ac_only)
+        return self.db.execute(f"""
+            SELECT game, COUNT(*) AS sessions, SUM(duration_s) AS secs,
+                   SUM(avg_fps*duration_s)/SUM(duration_s) AS avg_fps,
+                   SUM(low1*duration_s)/SUM(duration_s) AS low1,
+                   SUM(low01*duration_s)/SUM(duration_s) AS low01,
+                   MAX(avg_fps) AS best_avg, MIN(low01) AS worst_low01,
+                   SUM(gpu_temp_avg*duration_s)/SUM(CASE WHEN gpu_temp_avg IS NULL THEN 0 ELSE duration_s END) AS gpu_temp_avg,
+                   SUM(gpu_w_avg*duration_s)/SUM(CASE WHEN gpu_w_avg IS NULL THEN 0 ELSE duration_s END) AS gpu_w_avg,
+                   SUM(cpu_temp_avg*duration_s)/SUM(CASE WHEN cpu_temp_avg IS NULL THEN 0 ELSE duration_s END) AS cpu_temp_avg,
+                   MAX(gpu_temp_max) AS gpu_temp_max, MAX(cpu_temp_max) AS cpu_temp_max,
+                   MAX(vram_max_mb) AS vram_max_mb,
+                   MIN(start_ts) AS first_ts, MAX(end_ts) AS last_ts
+            FROM sessions{w} GROUP BY game ORDER BY secs DESC""", a).fetchall()
+
+    def game_total(self, game, machine=None):
+        for r in self.game_totals(machine):
+            if r["game"] == game:
+                return r
+        return None
+
+    def sessions(self, game=None, machine=None):
+        w, a = self._where(machine, game)
+        return self.db.execute(f"SELECT * FROM sessions{w} ORDER BY start_ts DESC", a).fetchall()
+
+    # --- güvenlik ---
+    def list_backups(self):
+        return sorted(glob.glob(os.path.join(BACKUP_DIR, "oyunlar-*.db")))
+
+    def backup_if_needed(self, force=False, refresh=False):
+        """force: zaman damgalı ek yedek; refresh: bugünün yedeğini güncel hale getir."""
+        stamp = "%Y-%m-%d_%H%M%S" if force else "%Y-%m-%d"
+        target = os.path.join(BACKUP_DIR, time.strftime(f"oyunlar-{stamp}.db"))
+        if os.path.exists(target) and not (force or refresh):
+            return
+        tmp = target + ".tmp"
+        dst = self.sqlite3.connect(tmp)
+        try:
+            self.db.backup(dst)
+        finally:
+            dst.close()
+        os.replace(tmp, target)  # yarım yedek asla gerçek yedeğin yerine geçmez
+        for old in self.list_backups()[:-BACKUP_KEEP]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+    def export_csv(self, out_path):
+        import csv
+        names = {m["machine_id"]: m["name"] for m in self.machines()}
+        rows = self.sessions()
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["pc", "oyun", "baslangic", "bitis", "sure_dk", "ort_fps", "low_1", "low_0.1",
+                        "maks_fps", "ort_frametime_ms", "gpu_c_ort", "gpu_c_maks", "cpu_c_ort",
+                        "cpu_c_maks", "gpu_w_ort", "cpu_w_ort", "vram_maks_mb", "prizde_oran", "not", "log"])
+            for r in rows:
+                def n(v, d=1):
+                    return "" if v is None else round(v, d)
+                w.writerow([names.get(r["machine_id"], r["machine_id"]), r["game"],
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(r["start_ts"])),
+                            time.strftime("%Y-%m-%d %H:%M", time.localtime(r["end_ts"])),
+                            n(r["duration_s"] / 60), n(r["avg_fps"]), n(r["low1"]), n(r["low01"]),
+                            n(r["max_fps"]), n(r["avg_ft"], 2), n(r["gpu_temp_avg"]), n(r["gpu_temp_max"]),
+                            n(r["cpu_temp_avg"]), n(r["cpu_temp_max"]), n(r["gpu_w_avg"]),
+                            n(r["cpu_w_avg"]), n(r["vram_max_mb"], 0), n(r["ac_ratio"], 2),
+                            r["note"] or "", r["log_file"]])
+
+
+# =============================================================================
+# GITHUB SENKRONU — her PC sadece makineler/<kimlik>/ klasörüne yazar (çakışma olmaz)
+# =============================================================================
+REPO_DIR = os.path.join(DATA_DIR, "depo")
+SYNC_INTERVAL_SEC = 15 * 60
+
+
+def _os_name():
+    if IS_WIN:
+        import platform
+        try:
+            build = int(platform.version().split(".")[-1])
+        except ValueError:
+            build = 0
+        return "Windows " + ("11" if build >= 22000 else platform.release())
+    for ln in read_str("/etc/os-release").splitlines():
+        if ln.startswith("PRETTY_NAME="):
+            return ln.split("=", 1)[1].strip('"')
+    return "Linux"
+
+
+class SyncManager:
+    def __init__(self, store, cfg, machine_info):
+        self.store = store
+        self.cfg = cfg
+        self.mid = cfg["kimlik"]
+        self.info = machine_info
+        self.enabled = cfg.get("senkron", "acik") != "kapali" and os.path.isdir(os.path.join(REPO_DIR, ".git"))
+        self.state = "kapalı" if not self.enabled else "bekliyor"
+        self.last_ok = None
+        self.last_error = None
+        self.update_available = False
+        self._notified_update_hash = None
+        self._thread = None
+        self._result = None
+        self._again = False
+        self.next_at = time.time() + 10  # açılıştan 10 sn sonra ilk senkron
+        self.check_app_update()
+
+    def check_app_update(self):
+        """Depodaki program/oyun-izleyici ile kurulu ~/.local/bin/oyun-izleyici farklı mı kontrol eder."""
+        import hashlib
+        repo_bin = os.path.join(REPO_DIR, "program", "oyun-izleyici")
+        inst_bin = INSTALLED_BIN
+        if not (os.path.isfile(repo_bin) and os.path.isfile(inst_bin)):
+            self.update_available = False
+            return False
+        try:
+            with open(repo_bin, "rb") as f1, open(inst_bin, "rb") as f2:
+                h1 = hashlib.sha256(f1.read()).hexdigest()
+                h2 = hashlib.sha256(f2.read()).hexdigest()
+            self.update_available = (h1 != h2)
+            if self.update_available and self._notified_update_hash != h1:
+                self._notified_update_hash = h1
+                notify("Oyun İzleyici — Güncelleme Mevcut!",
+                       "GitHub'dan yeni bir uygulama sürümü indirildi. "
+                       "Paneldeki 'GÜNCELLE' rozetine veya sağ tık menüsündeki 'Uygulamayı Şimdi Güncelle'ye tıklayın.")
+            return self.update_available
+        except OSError:
+            self.update_available = False
+            return False
+
+    # --- ana iş parçacığı ---
+    def request(self):
+        if not self.enabled:
+            return
+        if self._thread is not None:
+            self._again = True
+        else:
+            self.next_at = 0
+
+    def tick(self):
+        """Panelin 500 ms'lik zamanlayıcısından çağrılır."""
+        if not self.enabled:
+            return False
+        if self._thread is not None:
+            if self._thread.is_alive():
+                return False
+            self._thread = None
+            ok, err = self._result
+            if ok:
+                self.last_ok, self.last_error, self.state = time.time(), None, "tamam"
+                self._import_repo()
+                self.check_app_update()
+            else:
+                self.last_error, self.state = err, "hata"
+            if self._again:
+                self._again = False
+                self.next_at = 0
+            return True
+        if time.time() >= self.next_at:
+            self.next_at = time.time() + SYNC_INTERVAL_SEC
+            self._start()
+        return False
+
+    def _start(self):
+        import threading
+        try:
+            self._import_repo()          # önce depodakini al (kendi kaybolan kayıtlarımız dahil)
+            self._export_own()           # sonra kendi klasörümüzü güncelle
+        except Exception as e:
+            self.last_error, self.state = f"dosya hatası: {e}", "hata"
+            return
+        self.state = "senkronize ediliyor"
+        self._thread = threading.Thread(target=self._git_worker, daemon=True)
+        self._thread.start()
+
+    def _own_dir(self):
+        return os.path.join(REPO_DIR, "makineler", self.mid)
+
+    @staticmethod
+    def _write_if_changed(path, text):
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == text:
+                    return False
+        except OSError:
+            pass
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+
+    def _export_own(self):
+        import json
+        d = self._own_dir()
+        os.makedirs(d, exist_ok=True)
+        info = dict(self.info, name=self.cfg.get("ad") or self.mid)
+        self._write_if_changed(os.path.join(d, "makine.json"),
+                               json.dumps(info, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        lines = []
+        for r in self.store.own_finished_sessions():
+            rec = {}
+            for c in SessionStore.SYNC_FIELDS:
+                v = r[c]
+                if isinstance(v, float):
+                    v = round(v, 2)
+                if v is not None:
+                    rec[c] = v
+            lines.append(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+        self._write_if_changed(os.path.join(d, "oturumlar.jsonl"), "\n".join(lines) + ("\n" if lines else ""))
+        self.store.changed_since_sync = False
+
+    def _import_repo(self):
+        import json
+        base = os.path.join(REPO_DIR, "makineler")
+        for d in sorted(glob.glob(os.path.join(base, "*"))):
+            mid = os.path.basename(d)
+            try:
+                with open(os.path.join(d, "makine.json"), encoding="utf-8") as f:
+                    info = json.load(f)
+            except (OSError, ValueError):
+                info = {"name": mid}
+            rows = []
+            try:
+                with open(os.path.join(d, "oturumlar.jsonl"), encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if ln:
+                            try:
+                                rows.append(json.loads(ln))
+                            except ValueError:
+                                continue
+            except OSError:
+                pass
+            if mid == self.mid:
+                self.store.restore_own_sessions(rows)
+            else:
+                self.store.upsert_machine(mid, info)
+                self.store.replace_machine_sessions(mid, rows)
+        self.store.upsert_machine(self.mid, dict(self.info, name=self.cfg.get("ad") or self.mid))
+
+    # --- arka plan (sadece git) ---
+    def _git(self, *args, timeout=90):
+        import subprocess
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if not IS_WIN:
+            env.update(GIT_ASKPASS="true", SSH_ASKPASS="true")
+        p = subprocess.run(["git", "-C", REPO_DIR, *args], capture_output=True, text=True,
+                           timeout=timeout, env=env, **_hidden())
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout).strip().splitlines()[-1] if (p.stderr or p.stdout).strip()
+                               else f"git {args[0]} başarısız")
+        return p.stdout
+
+    def _git_worker(self):
+        try:
+            rel = os.path.join("makineler", self.mid)
+            self._git("add", "--", rel)
+            if self._git("status", "--porcelain", "--", rel).strip():
+                self._git("-c", f"user.name=oyun-izleyici ({self.mid})",
+                          "-c", f"user.email={self.mid}@oyun-izleyici.local",
+                          "commit", "-q", "-m", f"{self.cfg.get('ad') or self.mid}: kayıtlar güncellendi")
+            self._git("pull", "-q", "--rebase", "--autostash")
+            ahead = self._git("rev-list", "--count", "@{u}..HEAD").strip()
+            if ahead and ahead != "0":
+                self._git("push", "-q")
+            self._result = (True, None)
+        except Exception as e:
+            self._result = (False, str(e))
+
+    def status_text(self):
+        if not self.enabled:
+            return "GitHub senkronu kapalı (kurulmamış)"
+        upd = "   ·   ⬆ Yeni uygulama güncellemesi hazır!" if self.update_available else ""
+        if self.state == "senkronize ediliyor":
+            return "GitHub: senkronize ediliyor…" + upd
+        if self.last_error:
+            return f"GitHub: HATA — {self.last_error}" + upd
+        if self.last_ok:
+            return "GitHub: son senkron " + time.strftime("%H:%M", time.localtime(self.last_ok)) + " ✓" + upd
+        return "GitHub: bekliyor" + upd
+
+
+def apply_app_update(parent_win=None):
+    """kur.sh betiğini çalıştırarak ~/.local/bin/oyun-izleyici'yi günceller ve uygulamayı yerinde yeniden başlatır."""
+    import shutil
+    repo_bin = os.path.join(REPO_DIR, "program", "oyun-izleyici")
+    inst_bin = INSTALLED_BIN
+    if not os.path.isfile(repo_bin):
+        notify("Oyun İzleyici", "Güncelleme dosyası bulunamadı.")
+        return
+    try:
+        os.makedirs(os.path.dirname(inst_bin), exist_ok=True)
+        if os.path.isfile(inst_bin):
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(inst_bin, f"{inst_bin}.yedek-{ts}")
+        shutil.copy2(repo_bin, inst_bin)
+        os.chmod(inst_bin, 0o755)
+    except Exception as e:
+        notify("Oyun İzleyici — Güncelleme Hatası", str(e))
+        return
+    if parent_win is not None:
+        try:
+            parent_win.shutdown()
+        except Exception:
+            pass
+    notify("Oyun İzleyici Güncellendi", "Yeni sürüm kuruldu ve yeniden başlatılıyor…")
+    if IS_WIN:
+        import subprocess
+        py = sys.executable
+        if py.lower().endswith("python.exe"):
+            py = py[:-len("python.exe")] + "pythonw.exe"
+        subprocess.Popen([py, inst_bin], env=dict(os.environ, OI_RESTART="1"), close_fds=True,
+                         creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        os._exit(0)
+    os.execv(sys.executable, [sys.executable, inst_bin])
+
+
+# =============================================================================
+# MAKİNE AYARLARI (~/.config/oyun-izleyici/makine.conf) — her PC kendi dosyasını tutar
+# =============================================================================
+CONFIG_DIR = (os.path.join(_ROAM, "oyun-izleyici") if IS_WIN
+              else os.path.join(os.path.expanduser("~"), ".config", "oyun-izleyici"))
+MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
+
+
+def _slug(text):
+    s = re.sub(r"[^a-z0-9-]+", "-", text.lower()).strip("-")
+    return s or "pc"
+
+
+def load_machine_config():
+    """Yoksa varsayılanlarla oluşturur. kimlik = GitHub'daki klasör adı (PC başına sabit)."""
+    import configparser
+    import socket
+    cp = configparser.ConfigParser()
+    cp.read(MACHINE_CONF, encoding="utf-8-sig")
+    if not cp.has_section("makine"):
+        cp.add_section("makine")
+    host = socket.gethostname()
+    defaults = {
+        "kimlik": _slug(host),
+        "ad": host,
+        "gpu_adi": "",
+        "cpu_adi": "",
+        "ram_etiketi": "",
+        "mod": "otomatik",       # otomatik | panel | tepsi
+        "baslik": "",            # oyun yokken panelin altında görünen yazı (boşsa OYUN İZLEYİCİ)
+        "engelle": "",           # Windows: oyun sayılmayacak programlar (virgülle: foo.exe, bar.exe)
+        "senkron": "acik",       # acik | kapali
+    }
+    changed = False
+    for k, v in defaults.items():
+        if not cp.has_option("makine", k):
+            cp.set("makine", k, v)
+            changed = True
+    if changed:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(MACHINE_CONF, "w", encoding="utf-8") as f:
+            f.write("# Oyun İzleyici — bu PC'ye özel ayarlar\n"
+                    "# kimlik: GitHub deposundaki klasör adı (değiştirme), ad: listelerde görünen isim\n"
+                    "# mod: otomatik (2+ ekran = panel, tek ekran = sadece tepsi) | panel | tepsi\n")
+            cp.write(f)
+    cfg = dict(cp.items("makine"))
+    cfg["kimlik"] = _slug(cfg["kimlik"])
+    return cfg
+
+
+def _short_gpu_name(name):
+    m = re.search(r"\b((?:RX|RTX|GTX|Arc)\s[A-Z]?\d+[A-Z]*(?:\s(?:XTX|XT|GRE|Ti|SUPER))?)", name)
+    if m:
+        return m.group(1)
+    m = re.findall(r"\[([^\]]+)\]", name)
+    if m:
+        name = m[-1]
+    for junk in ("NVIDIA ", "GeForce ", "AMD ", "Radeon ", "Intel(R) ", "Corporation ", " Laptop GPU",
+                 " Mobile", " Max-Q", "Sapphire Pulse ", "Graphics"):
+        name = name.replace(junk, " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    if "/" in name:  # "RX 9070/9070 XT/9070 GRE" gibi aile adları
+        name = name.split("/")[0]
+    return name or "GPU"
+
+
+def _short_cpu_name(name):
+    name = name.replace("(R)", "").replace("(TM)", "").replace(" CPU", "")
+    name = re.sub(r"\s+\d+-Core Processor", "", name)
+    name = re.sub(r"@.*$", "", name)
+    m = re.search(r"Ryzen (\d+) (\w+)", name)
+    if m:
+        return f"R{m.group(1)} {m.group(2)}"
+    m = re.search(r"Core(?:\s+Ultra)?\s+(i\d-\w+|\d+\s+\w+)", name)
+    if m:
+        return ("Ultra " if "Ultra" in name else ("Core " if not m.group(1).startswith("i") else "")) + m.group(1)
+    name = name.replace("Intel ", "").replace("AMD ", "").replace("Processor", "")
+    return re.sub(r"\s+", " ", name).strip()[:16] or "CPU"
+
+
+class NvidiaPoller:
+    """nvidia-smi'yi arka planda okur. Kart uykudaysa (RTD3) uyandırmamak için sorgulamaz."""
+
+    FIELDS = "name,temperature.gpu,power.draw,memory.used,memory.total,clocks.gr,utilization.gpu,fan.speed"
+
+    def __init__(self, pci_dir, exe="nvidia-smi"):
+        import threading
+        self.pci_dir = pci_dir
+        self.exe = exe
+        self.data = {}
+        self.name = None
+        self._stop = False
+        self.wanted = True   # panel görünmüyorsa sorgulama (kartın uykuya geçmesini engellemesin)
+        self._poll(force=True)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def asleep(self):
+        if not self.pci_dir:
+            return False
+        return read_str(os.path.join(self.pci_dir, "power", "runtime_status")) == "suspended"
+
+    def _poll(self, force=False):
+        import subprocess
+        if not force and self.asleep():
+            self.data = {"asleep": True}
+            return
+        try:
+            out = subprocess.run([self.exe, f"--query-gpu={self.FIELDS}", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=5, **_hidden()).stdout.strip().splitlines()
+        except Exception:
+            return
+        if not out:
+            return
+        vals = [v.strip() for v in out[0].split(",")]
+        if len(vals) < 8:
+            return
+
+        def num(v):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        self.name = vals[0]
+        self.data = {"temp": num(vals[1]), "power": num(vals[2]), "mem_used": num(vals[3]),
+                     "mem_total": num(vals[4]), "clock": num(vals[5]), "util": num(vals[6]),
+                     "fan": num(vals[7])}
+
+    def _loop(self):
+        while not self._stop:
+            time.sleep(1.5)
+            if self.wanted:
+                self._poll()
+
+
+class GpuReader:
+    """Ekran kartını otomatik seçer: NVIDIA > en çok VRAM'li AMD > Intel."""
+
+    def __init__(self):
+        self.kind = None
+        self.dev = None
+        self.hwmon = None
+        self.nv = None
+        self.fan_hwmon_input = None
+        self.win_names = []
+        if IS_WIN:
+            self._init_windows()
+            return
+        cards = []
+        for d in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
+            if not os.path.isdir(d) or re.search(r"card\d+-", d):
+                continue
+            drv = os.path.basename(os.path.realpath(os.path.join(d, "driver"))) if os.path.exists(
+                os.path.join(d, "driver")) else ""
+            vram = read_int(os.path.join(d, "mem_info_vram_total"), 0)
+            cards.append((drv, vram, d))
+        nv = [c for c in cards if c[0] == "nvidia"]
+        amd = sorted([c for c in cards if c[0] == "amdgpu"], key=lambda c: -c[1])
+        intel = [c for c in cards if c[0] in ("i915", "xe")]
+        if nv and shutil_which("nvidia-smi"):
+            self.kind, self.dev = "nvidia", nv[0][2]
+            self.nv = NvidiaPoller(self.dev)
+        elif amd:
+            self.kind, self.dev = "amd", amd[0][2]
+            hw = glob.glob(os.path.join(self.dev, "hwmon", "hwmon*"))
+            self.hwmon = hw[0] if hw else None
+        elif intel:
+            self.kind, self.dev = "intel", intel[0][2]
+        # Laptoplarda GPU fanı çoğu zaman üretici sürücüsünde (ör. asus: gpu_fan)
+        for lab in glob.glob("/sys/class/hwmon/hwmon*/fan*_label"):
+            if "gpu" in read_str(lab).lower():
+                self.fan_hwmon_input = lab.replace("_label", "_input")
+                break
+
+    def _init_windows(self):
+        exe = shutil_which("nvidia-smi")
+        if not exe:
+            for cand in (r"C:\Windows\System32\nvidia-smi.exe",
+                         r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"):
+                if os.path.exists(cand):
+                    exe = cand
+                    break
+        self.win_names = _win_gpu_names()
+        if exe:
+            self.kind = "nvidia"
+            self.nv = NvidiaPoller(None, exe=exe)
+        elif self.win_names:
+            self.kind = "win"          # AMD / Intel: Windows'ta sürücüsüz sensör yok; sadece ad
+
+    def name(self):
+        if self.kind == "win":
+            return _short_gpu_name(self.win_names[0]) if self.win_names else "GPU"
+        if self.kind == "nvidia" and self.nv and self.nv.name:
+            return _short_gpu_name(self.nv.name)
+        if self.dev:
+            slot = os.path.basename(os.path.realpath(self.dev))
+            try:
+                import subprocess
+                out = subprocess.run(["lspci", "-mm", "-s", slot], capture_output=True, text=True,
+                                     timeout=3).stdout
+                parts = re.findall(r'"([^"]*)"', out)
+                # Önce alt sistem adı (ör. "Sapphire Pulse Radeon RX 9070 XT"), sonra aile adı
+                for cand in (parts[4] if len(parts) > 4 else "", parts[2] if len(parts) > 2 else ""):
+                    if re.search(r"\b(RX|RTX|GTX|Arc)\s", cand):
+                        return _short_gpu_name(cand)
+                if len(parts) >= 3:
+                    return _short_gpu_name(parts[2])
+            except Exception:
+                pass
+        return "GPU"
+
+    def read(self, t):
+        if self.kind == "amd":
+            d = self.dev
+            t.gpu_load = read_int(os.path.join(d, "gpu_busy_percent"), 0)
+            vu = read_int(os.path.join(d, "mem_info_vram_used"), 0)
+            vt = read_int(os.path.join(d, "mem_info_vram_total"), 0)
+            t.vram_used_mb, t.vram_total_mb = int(vu / 1048576), max(1, int(vt / 1048576))
+            if self.hwmon:
+                h = self.hwmon
+                t.fan_rpm = read_int(os.path.join(h, "fan1_input"), 0)
+                pwm_max = max(1, read_int(os.path.join(h, "pwm1_max"), 255))
+                t.fan_pct = int(round(read_int(os.path.join(h, "pwm1"), 0) / pwm_max * 100))
+                p_uw = read_int(os.path.join(h, "power1_average"), 0) or read_int(os.path.join(h, "power1_input"), 0)
+                t.gpu_watt = int(round(p_uw / 1e6))
+                t.gpu_temp = int(round(read_int(os.path.join(h, "temp1_input"), 0) / 1000))
+                t.gpu_mhz = int(round(read_int(os.path.join(h, "freq1_input"), 0) / 1e6))
+        elif self.kind == "nvidia":
+            dd = self.nv.data
+            if dd.get("asleep"):
+                t.gpu_load, t.gpu_watt, t.gpu_mhz = 0, 0, 0
+                t.gpu_temp = None   # uykudaki kart sıcaklık vermez
+                t.vram_used_mb = 0
+            else:
+                t.gpu_load = int(dd.get("util") or 0)
+                t.gpu_watt = int(round(dd["power"])) if dd.get("power") is not None else None
+                t.gpu_temp = int(round(dd["temp"])) if dd.get("temp") is not None else None
+                t.gpu_mhz = int(dd.get("clock") or 0)
+                t.vram_used_mb = int(dd.get("mem_used") or 0)
+                if dd.get("mem_total"):
+                    t.vram_total_mb = int(dd["mem_total"])
+                if dd.get("fan") is not None:
+                    t.fan_pct = int(dd["fan"])
+        elif self.kind == "win":
+            t.gpu_load, t.gpu_watt, t.gpu_temp, t.gpu_mhz = 0, None, None, 0
+        elif self.kind == "intel":
+            t.gpu_load, t.gpu_watt, t.gpu_temp = 0, None, None
+            f = glob.glob(os.path.join(self.dev, "drm", "card*", "gt_act_freq_mhz"))
+            t.gpu_mhz = read_int(f[0], 0) if f else 0
+        if self.fan_hwmon_input:
+            t.fan_rpm = read_int(self.fan_hwmon_input, 0)
+        t.vram_pct = int(round(t.vram_used_mb / max(1, t.vram_total_mb) * 100))
+
+
+def shutil_which(cmd):
+    import shutil
+    return shutil.which(cmd)
+
+
+class CpuReader:
+    """İşlemci sıcaklığı / gücü / çekirdek yükleri — AMD ve Intel."""
+
+    def __init__(self):
+        self.name_full = ""
+        try:
+            with open("/proc/cpuinfo") as f:
+                for ln in f:
+                    if ln.startswith("model name"):
+                        self.name_full = ln.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+        self.temp_input = None
+        hw_by_name = {read_str(os.path.join(h, "name")): h for h in glob.glob("/sys/class/hwmon/hwmon*")}
+        if "k10temp" in hw_by_name:
+            self.temp_input = os.path.join(hw_by_name["k10temp"], "temp1_input")
+        elif "zenpower" in hw_by_name:
+            self.temp_input = os.path.join(hw_by_name["zenpower"], "temp1_input")
+        elif "coretemp" in hw_by_name:
+            h = hw_by_name["coretemp"]
+            for lab in glob.glob(os.path.join(h, "temp*_label")):
+                if read_str(lab).startswith("Package"):
+                    self.temp_input = lab.replace("_label", "_input")
+            if not self.temp_input:
+                self.temp_input = os.path.join(h, "temp1_input")
+        else:
+            for tz in glob.glob("/sys/class/thermal/thermal_zone*"):
+                if read_str(os.path.join(tz, "type")) in ("x86_pkg_temp", "cpu-thermal"):
+                    self.temp_input = os.path.join(tz, "temp")
+        # Güç: AMD APU'da iGPU'nun PPT değeri paket gücüdür; Intel/AMD RAPL okunabiliyorsa o
+        self.ppt_input = None
+        for d in glob.glob("/sys/class/drm/card[0-9]*/device"):
+            if os.path.basename(os.path.realpath(os.path.join(d, "driver"))) == "amdgpu" and \
+                    read_int(os.path.join(d, "mem_info_vram_total"), 0) < 2 * 1024 ** 3:
+                for p in glob.glob(os.path.join(d, "hwmon", "hwmon*", "power1_input")):
+                    self.ppt_input = p
+        self.rapl = None
+        for r in ("/sys/class/powercap/intel-rapl:0/energy_uj", "/sys/class/powercap/amd-rapl:0/energy_uj"):
+            if os.access(r, os.R_OK) and read_int(r, -1) >= 0:
+                self.rapl = r
+                break
+        self._rapl_prev = None
+        # Fiziksel çekirdekler: aynı core_cpus_list'e sahip iş parçacıkları tek çubuk
+        groups = {}
+        for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
+            idx = int(re.search(r"(\d+)$", c).group(1))
+            key = read_str(os.path.join(c, "topology", "core_cpus_list"), str(idx))
+            groups.setdefault(key, []).append(idx)
+        self.cores = sorted(groups.values(), key=lambda g: min(g))[:16]
+        self.prev = self._read_proc_stat()
+
+    def name(self):
+        return _short_cpu_name(self.name_full) if self.name_full else "CPU"
+
+    @staticmethod
+    def _read_proc_stat():
+        res = {}
+        try:
+            with open("/proc/stat") as f:
+                for line in f:
+                    if line.startswith("cpu"):
+                        parts = line.split()
+                        vals = [int(x) for x in parts[1:9]]
+                        res[parts[0]] = (vals[3] + vals[4], sum(vals))
+        except Exception:
+            pass
+        return res
+
+    def read(self, t):
+        now = self._read_proc_stat()
+
+        def load(key):
+            if key in now and key in self.prev:
+                (i0, t0), (i1, t1) = self.prev[key], now[key]
+                return max(0, min(100, int(round((1.0 - (i1 - i0) / max(1, t1 - t0)) * 100))))
+            return 0
+        t.cpu_load = load("cpu")
+        t.core_loads = [max(load(f"cpu{i}") for i in g) for g in self.cores] or [t.cpu_load]
+        self.prev = now
+        if self.temp_input:
+            t.cpu_temp = int(round(read_int(self.temp_input, 0) / 1000))
+        if self.ppt_input:
+            t.cpu_watt = int(round(read_int(self.ppt_input, 0) / 1e6))
+        elif self.rapl:
+            e, ts = read_int(self.rapl, 0), time.monotonic()
+            if self._rapl_prev and e >= self._rapl_prev[0]:
+                t.cpu_watt = int(round((e - self._rapl_prev[0]) / 1e6 / max(0.1, ts - self._rapl_prev[1])))
+            self._rapl_prev = (e, ts)
+        else:
+            t.cpu_watt = None
+        max_khz = max((read_int(f, 0) for f in glob.glob(
+            "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")), default=0)
+        t.cpu_ghz = round(max_khz / 1e6, 2) if max_khz else None
+
+
+def read_power_source():
+    """True = prizde, False = pilde, None = pil yok (masaüstü)."""
+    if IS_WIN:
+        ps = _win_psutil()
+        try:
+            b = ps.sensors_battery() if ps else None
+        except Exception:
+            b = None
+        return None if b is None else bool(b.power_plugged)
+    has_battery = False
+    for p in glob.glob("/sys/class/power_supply/*"):
+        typ = read_str(os.path.join(p, "type"))
+        if typ == "Battery":
+            has_battery = True
+    if not has_battery:
+        return None
+    for p in glob.glob("/sys/class/power_supply/*"):
+        if read_str(os.path.join(p, "type")) in ("Mains", "USB") and read_str(os.path.join(p, "online")) == "1":
+            return True
+    return False
+
+
+# =============================================================================
+# OYUN İÇİ GÖSTERGE (MangoHud) — oyunun kendi görüntüsüne çizilir, tam ekranda da üstte kalır.
+# MangoHud ayar dosyasını izlediği için değişiklik açık oyunda anında uygulanır.
+# =============================================================================
+MH_CONF = os.path.join(os.path.expanduser("~"), ".config", "MangoHud", "MangoHud.conf")
+MH_ORIG = MH_CONF + ".orijinal"
+OVERLAY_MODES = [("gizli", "Gizli (sadece kayıt)"), ("tek", "Tek satır (üstte, sadece metin)"),
+                 ("detay", "Detaylı kutu"), ("kendi", "Kendi MangoHud ayarım")]
+OVERLAY_POSITIONS = [("top-left", "Sol üst"), ("top-center", "Üst orta"), ("top-right", "Sağ üst"),
+                     ("bottom-left", "Sol alt"), ("bottom-right", "Sağ alt")]
+OVERLAY_ALPHAS = [(0.0, "Arka plan yok (tam saydam)"), (0.3, "Hafif koyu (%30)"),
+                  (0.5, "Orta (%50)"), (0.8, "Koyu (%80)")]
+OVERLAY_SIZES = [(16, "Küçük"), (20, "Orta"), (26, "Büyük")]
+_MH_LOGGING = ["output_folder=/tmp/mangohud_live", "log_interval=100", "autostart_log=1"]
+
+
+def mangohud_gpu_slot(gpu):
+    """Birden fazla ekran kartı varsa MangoHud kaydının hangi karta bakacağını belirleyen PCI adresi.
+    pci_dev olmazsa MangoHud ilk karta (çoğu AMD masaüstünde işlemcinin içindeki iGPU) bakar ve
+    GPU °C / W / VRAM yanlış kaydedilir. Şimdilik sadece AMD için (NVIDIA yolu laptopta doğrulanmadı)."""
+    try:
+        if gpu is None or gpu.kind != "amd" or not gpu.dev:
+            return None
+        n = sum(1 for d in glob.glob("/sys/class/drm/card[0-9]*/device")
+                if os.path.isdir(d) and not re.search(r"card\d+-", d) and os.path.exists(os.path.join(d, "driver")))
+        return os.path.basename(os.path.realpath(gpu.dev)) if n >= 2 else None
+    except Exception:
+        return None
+
+
+def ensure_mangohud_gpu(gpu):
+    """Mevcut MangoHud.conf'ta pci_dev yoksa ekler (bir kez yedek alır). Eklediyse True."""
+    slot = mangohud_gpu_slot(gpu)
+    if not slot or not os.path.exists(MH_CONF):
+        return False
+    try:
+        with open(MH_CONF, encoding="utf-8") as f:
+            text = f.read()
+        if re.search(r"^\s*pci_dev\s*=", text, re.M):
+            return False
+        bak = MH_CONF + ".yedek-pcidev"
+        if not os.path.exists(bak):
+            import shutil
+            shutil.copy2(MH_CONF, bak)
+        with open(MH_CONF, "a", encoding="utf-8") as f:   # yerinde ekle: açık oyunda da uygulanır
+            f.write(("" if text.endswith("\n") else "\n") +
+                    f"# Oyun İzleyici: kayıt iGPU'ya değil bu ekran kartına bakar\npci_dev={slot}\n")
+        return True
+    except OSError:
+        return False
+
+
+def build_mangohud_config(mode, pos="top-center", bg=0.3, size=20, pci_dev=None):
+    head = [f"# Oyun İzleyici tarafından yazıldı (mod: {mode}). Değiştirmek için: panel/tepsi menüsü ->",
+            "# Oyun İçi Gösterge. Oyunda göster/gizle: Sağ Shift + F12. Elle düzenlersen 'Kendi ayarım'ı seç."]
+    if mode == "gizli":
+        body = ["legacy_layout=0", "alpha=0", "background_alpha=0", "hud_no_margin"]
+    else:
+        body = ["legacy_layout=0", f"position={pos}", f"font_size={size}", f"background_alpha={bg}",
+                "background_color=000000", "text_outline", "text_color=FFFFFF",
+                "gpu_color=40FF70", "cpu_color=40FF70", "vram_color=40FF70", "ram_color=40FF70",
+                "fps_color_change", "fps_value=60,120", "fps_color=FF5555,FFDD33,40FF70"]
+        if mode == "tek":
+            body += ["horizontal", "hud_compact", "hud_no_margin", "table_columns=20", "round_corners=6",
+                     "fps", "frametime", "frame_timing=0",
+                     "gpu_text=GPU", "gpu_stats", "gpu_temp", "gpu_power",
+                     "cpu_text=CPU", "cpu_stats", "cpu_temp", "vram", "ram"]
+        else:  # detay
+            body += ["table_columns=3", "round_corners=8", "fps", "fps_metrics=avg,0.01", "frametime",
+                     "frame_timing=1", "gpu_text=GPU", "gpu_stats", "gpu_temp", "gpu_power", "gpu_core_clock",
+                     "vram", "cpu_text=CPU", "cpu_stats", "cpu_temp", "cpu_power", "cpu_mhz", "ram"]
+    if pci_dev:
+        body.append(f"pci_dev={pci_dev}")   # hem gösterge hem kayıt sadece bu ekran kartına baksın
+    return "\n".join(head + body + ["toggle_hud=Shift_R+F12"] + _MH_LOGGING) + "\n"
+
+
+def _with_logging(text, pci_dev=None):
+    """Kullanıcının kendi ayarına kayıt satırlarını ekler (no_display kaydı engellediği için saydamlığa çevirir)."""
+    lines = text.splitlines()
+    had_no_display = any(re.match(r"^\s*no_display\s*(=.*)?$", ln) for ln in lines)
+    drop = re.compile(r"^\s*(no_display|output_folder|autostart_log|log_duration|log_interval)\s*(=.*)?$")
+    out = [ln for ln in lines if not drop.match(ln)]
+    if had_no_display:
+        out = [ln for ln in out if not re.match(r"^\s*(legacy_layout|alpha|background_alpha)\s*=", ln)]
+        out += ["legacy_layout=0", "alpha=0", "background_alpha=0"]
+    if pci_dev and not any(re.match(r"^\s*pci_dev\s*=", ln) for ln in out):
+        out.append(f"pci_dev={pci_dev}")
+    return "\n".join(out + _MH_LOGGING) + "\n"
+
+
+def apply_overlay(mode, pos, bg, size, pci_dev=None):
+    os.makedirs(os.path.dirname(MH_CONF), exist_ok=True)
+    if not os.path.exists(MH_ORIG) and os.path.exists(MH_CONF):
+        import shutil
+        shutil.copy2(MH_CONF, MH_ORIG)   # ilk değişiklikten önceki ayar: "Kendi ayarım"
+    if mode == "kendi":
+        try:
+            with open(MH_ORIG, encoding="utf-8") as f:
+                text = _with_logging(f.read(), pci_dev)
+        except OSError:
+            text = build_mangohud_config("gizli", pci_dev=pci_dev)
+    else:
+        text = build_mangohud_config(mode, pos, bg, size, pci_dev)
+    # Yerinde yaz (dosyayı değiştirmeden): MangoHud inotify ile izliyor, açık oyunda anında yenilenir
+    with open(MH_CONF, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+
+# =============================================================================
+# WINDOWS DESTEĞİ — sensörler (psutil / nvidia-smi / WMI) ve PresentMon ile kare yakalama
+# Linux'ta bu sınıflar kullanılmaz (MangoHud kaydı + /sys, /proc okunur).
+# =============================================================================
+def _hidden():
+    """Windows'ta alt süreçler konsol penceresi açmasın."""
+    if not IS_WIN:
+        return {}
+    import subprocess
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
+def _win_psutil():
+    try:
+        import psutil
+        return psutil
+    except ImportError:
+        return None
+
+
+def windows_foreground_pid():
+    """Ön plandaki pencerenin süreç numarası (yoksa None)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(pid))
+        return pid.value or None
+    except Exception:
+        return None
+
+
+def _win_cpu_name():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+    except Exception:
+        import platform
+        return platform.processor() or "CPU"
+
+
+def _win_gpu_names():
+    """Windows'taki ekran kartı adları (WMI)."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
+            capture_output=True, text=True, errors="replace", timeout=20, **_hidden()).stdout
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+class WinThermal:
+    """ACPI ısıl bölge sıcaklığı (°C). Kalıcı bir PowerShell süreci WMI'yi 3 sn'de bir okur; yönetici gerekmez.
+    Bu işlemci sıcaklığı değil, dizüstünün ısıl bölgesidir (genelde işlemciye yakın bir değer)."""
+
+    SCRIPT = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "while($true){"
+        "$v=@(Get-CimInstance -Namespace root/cimv2 -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation"
+        " | ForEach-Object {[double]$_.Temperature});"
+        "if(-not $v){$v=@(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature"
+        " | ForEach-Object {[double]$_.CurrentTemperature/10})};"
+        "Write-Output ('T ' + (($v | ForEach-Object {[string]::Format([Globalization.CultureInfo]::InvariantCulture,'{0:F1}',$_)}) -join ' '));"
+        "[Console]::Out.Flush();Start-Sleep -Seconds 3}"
+    )
+
+    def __init__(self):
+        import threading
+        self.celsius = None
+        self.proc = None
+        self._stop = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def parse_line(line):
+        """'T 305.1 310.0' -> en yüksek geçerli sıcaklık (°C); geçerli değer yoksa None."""
+        if not line.startswith("T "):
+            return None
+        vals = []
+        for tok in line[2:].split():
+            try:
+                k = float(tok)
+            except ValueError:
+                continue
+            if 250.0 < k < 400.0:          # Kelvin: -23..127 °C
+                vals.append(k - 273.15)
+        return max(vals) if vals else None
+
+    def _run(self):
+        import subprocess
+        try:
+            self.proc = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-Command", self.SCRIPT],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, **_hidden())
+            for line in self.proc.stdout:
+                if self._stop:
+                    break
+                self.celsius = self.parse_line(line.strip())
+        except Exception:
+            self.celsius = None
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self.proc:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+
+class WinCpuReader:
+    """Windows: psutil ile yük / frekans / RAM, ısıl bölge sıcaklığı. İşlemci gücü (W) Windows'ta sürücüsüz okunamaz."""
+
+    def __init__(self):
+        self.ps = _win_psutil()
+        self.name_full = _win_cpu_name()
+        self.cores = [[0]]
+        if self.ps:
+            logical = self.ps.cpu_count(logical=True) or 1
+            physical = self.ps.cpu_count(logical=False) or logical
+            if logical == 2 * physical:                       # SMT: çiftler tek çekirdek
+                self.cores = [[i, i + 1] for i in range(0, logical, 2)]
+            else:                                             # hibrit / SMT yok: her mantıksal işlemci ayrı
+                self.cores = [[i] for i in range(min(logical, 16))]
+            self.ps.cpu_percent(percpu=True)                  # ilk çağrı boş döner: ısıt
+        self.thermal = WinThermal()
+
+    def name(self):
+        return _short_cpu_name(self.name_full) if self.name_full else "CPU"
+
+    def read(self, t):
+        if self.ps:
+            per = self.ps.cpu_percent(percpu=True)
+            if per:
+                t.cpu_load = int(round(sum(per) / len(per)))
+                t.core_loads = [int(round(max(per[i] for i in g if i < len(per)))) for g in self.cores
+                                if any(i < len(per) for i in g)] or [t.cpu_load]
+            try:
+                f = self.ps.cpu_freq()
+                t.cpu_ghz = round(f.current / 1000.0, 2) if f and f.current else None
+            except Exception:
+                t.cpu_ghz = None
+        c = self.thermal.celsius
+        t.cpu_temp = int(round(c)) if c is not None else None
+        t.cpu_watt = None
+
+    def stop(self):
+        self.thermal.stop()
+
+
+def win_read_memory(t):
+    ps = _win_psutil()
+    if not ps:
+        return
+    vm = ps.virtual_memory()
+    t.ram_used_gb = (vm.total - vm.available) / 1024 ** 3
+    t.ram_total_gb = vm.total / 1024 ** 3
+    t.ram_pct = int(round((vm.total - vm.available) / max(1, vm.total) * 100))
+
+
+WIN_IGNORED_EXES = {
+    # Windows kabuğu / sistem
+    "dwm.exe", "explorer.exe", "searchhost.exe", "searchapp.exe", "shellexperiencehost.exe",
+    "startmenuexperiencehost.exe", "textinputhost.exe", "applicationframehost.exe", "lockapp.exe",
+    "widgets.exe", "widgetservice.exe", "systemsettings.exe", "taskmgr.exe", "msedgewebview2.exe",
+    # tarayıcılar / ofis / sohbet / medya
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe",
+    "discord.exe", "teams.exe", "ms-teams.exe", "slack.exe", "spotify.exe", "whatsapp.exe", "telegram.exe",
+    "code.exe", "devenv.exe", "obs64.exe", "obs32.exe", "vlc.exe", "mpv.exe", "wmplayer.exe", "video.ui.exe",
+    "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "notepad.exe", "onedrive.exe",
+    # oyun başlatıcıları (oyunun kendisi değil)
+    "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "epicwebhelper.exe", "battle.net.exe",
+    "galaxyclient.exe", "riotclientservices.exe", "riotclientux.exe", "ubisoftconnect.exe", "upc.exe",
+    # bu program ve kare yakalama araçları
+    "python.exe", "pythonw.exe", "presentmon.exe", "msiafterburner.exe", "rtss.exe", "nvcontainer.exe",
+}
+
+
+class WinFrameCapture:
+    """Windows'ta PresentMon ile sunulan kareleri yakalar ve MangoHud ile AYNI biçimde
+    <program>.exe_<tarih>.csv yazar; böylece oturum / filtre / veritabanı kodu hiç değişmeden çalışır.
+
+    - Oyunu otomatik seçer: ≥15 FPS üreten, engelli listede olmayan süreç (ön plandaysa hemen,
+      değilse 8 sn kararlı üretince).
+    - Her 100 ms'de bir satır yazar (MangoHud ile aynı aralık)."""
+
+    HEADER_INFO = "os,cpu,gpu,ram,kernel,driver,cpuscheduler"
+    COLS = ("fps,frametime,cpu_load,cpu_power,gpu_load,cpu_temp,gpu_temp,gpu_core_clock,gpu_mem_clock,"
+            "gpu_vram_used,gpu_power,ram_used,swap_used,process_rss,cpu_mhz,elapsed")
+    BUCKET_SEC = 0.1
+    WINDOW_SEC = 2.0
+    START_FPS = 15.0
+    BG_START_SEC = 8.0
+    STALL_WRITE_SEC = 5.0
+    SESSION_NAME = "oyun-izleyici"
+
+    def __init__(self, out_dir, exe_path, telemetry, extra_ignore=()):
+        import threading
+        self.out_dir, self.exe, self.t = out_dir, exe_path, telemetry
+        self.ignore = set(WIN_IGNORED_EXES) | {x.strip().lower() for x in extra_ignore if x and x.strip()}
+        self.lock = threading.Lock()
+        self.proc = None
+        self.status = "başlamadı"
+        self.error = None
+        self._error_reported = None
+        self._stop = False
+        self._frames = {}       # pid -> deque[(t, ft_ms)]
+        self._names = {}        # pid -> exe adı
+        self._last_ts = {}      # pid -> son CPUStartTime (kare süresi sütunu yoksa)
+        self._qual_since = {}   # pid -> ilk uygun olduğu an
+        self._active = None
+        self._bucket = []
+        self.frames_seen = 0
+        self.rows_written = 0
+        self.header = None
+        os.makedirs(out_dir, exist_ok=True)
+
+    # --- yaşam döngüsü ---
+    def start(self):
+        import threading
+        if not os.path.isfile(self.exe):
+            self.status, self.error = "PresentMon yok", f"PresentMon bulunamadı: {self.exe}"
+            return False
+        self._kill_stale()
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._ticker, daemon=True).start()
+        return True
+
+    def stop(self):
+        self._stop = True
+        with self.lock:
+            self._close_active()
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+    def take_error(self):
+        """Yeni bir hata oluştuysa metnini bir kez döndürür (bildirim için)."""
+        if self.error and self.error != self._error_reported:
+            self._error_reported = self.error
+            return self.error
+        return None
+
+    def _kill_stale(self):
+        """Önceki çalıştırmadan kalmış PresentMon'u (aynı dosya yolu) kapat."""
+        ps = _win_psutil()
+        if not ps:
+            return
+        mine = os.path.normcase(os.path.abspath(self.exe))
+        for p in ps.process_iter(["pid", "exe"]):
+            try:
+                if p.info["exe"] and os.path.normcase(p.info["exe"]) == mine and p.info["pid"] != os.getpid():
+                    p.terminate()
+            except Exception:
+                continue
+
+    # --- PresentMon çıktısı ---
+    def _spawn(self):
+        import subprocess
+        args = [self.exe, "--session_name", self.SESSION_NAME, "--stop_existing_session",
+                "--output_stdout", "--no_console_stats", "--v1_metrics"]
+        for n in ("dwm.exe", "explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+                  "python.exe", "pythonw.exe", "steamwebhelper.exe", "discord.exe"):
+            args += ["--exclude", n]
+        errlog = open(os.path.join(self.out_dir, "presentmon.log"), "w", encoding="utf-8")
+        return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errlog, text=True, bufsize=1,
+                                encoding="utf-8", errors="replace", **_hidden())
+
+    @staticmethod
+    def parse_header(parts):
+        """Başlık satırından sütun konumları. Beklenen: Application, ProcessID ve bir kare süresi sütunu
+        (v1: msBetweenPresents, v2: MsBetweenPresents / FrameTime) ya da CPU zamanı (TimeInSeconds / CPUStartTime)."""
+        low = [p.strip().lower() for p in parts]
+        if "application" not in low or "processid" not in low:
+            return None
+        idx = {"app": low.index("application"), "pid": low.index("processid"), "ft": None, "ts": None}
+        for n in ("msbetweenpresents", "frametime"):
+            if n in low:
+                idx["ft"] = low.index(n)
+                break
+        for n in ("timeinseconds", "cpustarttime"):
+            if n in low:
+                idx["ts"] = low.index(n)
+                break
+        return idx
+
+    def _reader(self):
+        import csv
+        wait = 5
+        while not self._stop:
+            started = time.monotonic()
+            try:
+                self.proc = self._spawn()
+            except Exception as e:
+                self.status, self.error = "hata", f"PresentMon başlatılamadı: {e}"
+                time.sleep(30)
+                continue
+            self.status = "çalışıyor"
+            idx = None
+            for line in self.proc.stdout:
+                if self._stop:
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                parts = next(csv.reader([line]))
+                if idx is None:
+                    idx = self.parse_header(parts)
+                    if idx is not None:
+                        self.header = line
+                        if idx["ft"] is None and idx["ts"] is None:
+                            self.error = "PresentMon çıktısında kare süresi sütunu yok: " + line[:160]
+                            idx = None
+                    continue
+                self.on_row(parts, idx)
+            if self._stop:
+                return
+            rc = self.proc.poll()
+            tail = ""
+            try:
+                with open(os.path.join(self.out_dir, "presentmon.log"), encoding="utf-8", errors="replace") as f:
+                    tail = " ".join(f.read().split())[-220:]
+            except OSError:
+                pass
+            self.status = "hata"
+            self.error = f"PresentMon kapandı (kod {rc}). {tail}".strip()
+            wait = 5 if time.monotonic() - started > 30 else min(60, wait * 2)
+            time.sleep(wait)
+
+    def on_row(self, parts, idx):
+        """PresentMon'dan gelen tek bir sunulan kare satırı (test edilebilsin diye ayrı)."""
+        from collections import deque
+        try:
+            pid = int(parts[idx["pid"]])
+            app = parts[idx["app"]].strip()
+        except (ValueError, IndexError):
+            return
+        now = time.monotonic()
+        ft = None
+        try:
+            if idx["ft"] is not None:
+                ft = float(parts[idx["ft"]])
+            elif idx["ts"] is not None:
+                ts = float(parts[idx["ts"]])
+                prev = self._last_ts.get(pid)
+                self._last_ts[pid] = ts
+                if prev is not None:
+                    ft = (ts - prev) * 1000.0
+        except (ValueError, IndexError):
+            return
+        if ft is None or not (0.05 <= ft <= 5000.0):
+            return
+        with self.lock:
+            self.frames_seen += 1
+            self._names[pid] = app
+            self._frames.setdefault(pid, deque()).append((now, ft))
+            if self._active is not None and self._active["pid"] == pid:
+                self._bucket.append(ft)
+
+    # --- 100 ms'lik zamanlayıcı: oyun seçimi + satır yazımı ---
+    def _ticker(self):
+        while not self._stop:
+            time.sleep(self.BUCKET_SEC)
+            try:
+                self.tick(time.monotonic())
+            except Exception as e:
+                self.error = f"kare yakalama hatası: {e}"
+
+    @staticmethod
+    def _pid_alive(pid):
+        ps = _win_psutil()
+        return bool(ps and ps.pid_exists(pid))
+
+    def _pick_candidate(self, now, exclude=None):
+        fg = windows_foreground_pid()
+        best = None
+        for pid, dq in self._frames.items():
+            if pid == exclude or pid == os.getpid():
+                continue
+            if self._names.get(pid, "").lower() in self.ignore or not self._pid_alive(pid):
+                continue
+            n = sum(1 for ts, _ in dq if now - ts <= self.WINDOW_SEC)
+            if n < self.START_FPS * self.WINDOW_SEC:
+                self._qual_since.pop(pid, None)
+                continue
+            since = self._qual_since.setdefault(pid, now)
+            if pid != fg and now - since < self.BG_START_SEC:
+                continue
+            if best is None or n > best[0]:
+                best = (n, pid)
+        return best[1] if best else None
+
+    def tick(self, now):
+        with self.lock:
+            for pid in list(self._frames):                      # eski kareleri ve ölü süreçleri temizle
+                dq = self._frames[pid]
+                while dq and now - dq[0][0] > 4.0:
+                    dq.popleft()
+                if not dq:
+                    del self._frames[pid]
+                    self._qual_since.pop(pid, None)
+            act = self._active
+            if act is not None:
+                if not self._pid_alive(act["pid"]):
+                    self._frames.pop(act["pid"], None)           # ölü sürecin kalan kareleri yeni oturum açmasın
+                    self._qual_since.pop(act["pid"], None)
+                    self._close_active()
+                    act = None
+                elif now - act["last_frame"] > self.STALL_WRITE_SEC and self._pick_candidate(now, act["pid"]):
+                    self._close_active()                         # başka bir oyun devraldı
+                    act = None
+            if act is None:
+                cand = self._pick_candidate(now)
+                if cand is not None:
+                    act = self._open(cand, now)
+            if act is not None:
+                self._write_bucket(act, now)
+
+    def _open(self, pid, now):
+        name = self._names.get(pid, "oyun.exe")
+        safe = re.sub(r'[<>:"/\\|?*\s,]+', "_", name) or "oyun.exe"
+        path = os.path.join(self.out_dir, f"{safe}_{time.strftime('%Y-%m-%d_%H-%M-%S')}.csv")
+        fh = open(path, "w", encoding="utf-8", newline="\n")
+        t = self.t
+        clean = lambda s: str(s or "").replace(",", " ")
+        fh.write(self.HEADER_INFO + "\n")
+        fh.write(",".join(["Windows", clean(getattr(t, "cpu_name", "")), clean(getattr(t, "gpu_name", "")),
+                           str(int(getattr(t, "ram_total_gb", 0) * 1048576)), "", "", ""]) + "\n")
+        fh.write(self.COLS + "\n")
+        fh.flush()
+        self._bucket = []
+        self._active = {"pid": pid, "name": name, "path": path, "fh": fh, "start": now,
+                        "last_frame": now, "last_ft": 16.7, "n": 0}
+        return self._active
+
+    def _close_active(self):
+        act, self._active = self._active, None
+        self._bucket = []
+        if act:
+            try:
+                act["fh"].close()
+            except OSError:
+                pass
+
+    def _write_bucket(self, act, now):
+        b, self._bucket = self._bucket, []
+        if b:
+            ft = sum(b) / len(b)
+            act["last_frame"], act["last_ft"] = now, ft
+        elif act["n"] == 0:
+            return                                               # ilk kare gelmeden satır yazma
+        else:
+            silent_ms = (now - act["last_frame"]) * 1000.0
+            if silent_ms > self.STALL_WRITE_SEC * 1000.0:
+                return                                           # küçültüldü / duraklatıldı: satır yazma
+            ft = max(act["last_ft"], silent_ms)                  # takılma sırasında FPS düşerek görünür
+        fps = min(2000.0, max(1.0, 1000.0 / ft))
+        t = self.t
+        v = lambda x: 0 if x is None else x
+        row = [f"{fps:.3f}", f"{ft:.3f}", v(getattr(t, "cpu_load", 0)), 0, v(getattr(t, "gpu_load", 0)),
+               v(getattr(t, "cpu_temp", 0)), v(getattr(t, "gpu_temp", 0)), v(getattr(t, "gpu_mhz", 0)), 0,
+               f"{v(getattr(t, 'vram_used_mb', 0)) / 1024.0:.3f}", v(getattr(t, "gpu_watt", 0)),
+               f"{v(getattr(t, 'ram_used_gb', 0)):.3f}", 0, 0, int(v(getattr(t, "cpu_ghz", 0)) * 1000),
+               int((now - act["start"]) * 1e9)]
+        try:
+            act["fh"].write(",".join(str(x) for x in row) + "\n")
+            act["fh"].flush()
+            act["n"] += 1
+            self.rows_written += 1
+        except OSError:
+            self._close_active()
+
+
+def cleanup_old_logs(directory, days=3):
+    """Windows'ta /tmp gibi kendiliğinden temizlenen bir klasör yok: eski kayıt dosyalarını sil."""
+    cutoff = time.time() - days * 86400
+    for path in glob.glob(os.path.join(directory, "*.csv")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+UI_FAMILIES = ["Noto Sans", "Segoe UI", "Arial"]
+
+
+def make_font(size, weight=QFont.Weight.Black):
+    """Noto Sans yoksa (Windows) Segoe UI / Arial'a düşen yazı tipi."""
+    f = QFont()
+    f.setFamilies(UI_FAMILIES)
+    f.setPointSize(size)
+    f.setWeight(weight)
+    return f
+
+
+class HardwareTelemetry:
+    def __init__(self, store=None):
+        self.store = store
+        self.session = None
+        self.finished_events = []
+        self._last_scan = 0.0
+        self._last_checkpoint = time.monotonic()
+        self.cfg = load_machine_config()
+        self.gpu = GpuReader()
+        self.cpu = WinCpuReader() if IS_WIN else CpuReader()
+        self.capture = None
+        self.on_ac = read_power_source()
+
+        # MangoHud log takibi (dosya değişince sıfırlanır)
+        self.fps_hist = deque(maxlen=FPS_WINDOW_ROWS)
+        self._log_path = None
+        self._log_pos = 0
+        self._log_cols = None
+        self._log_partial = ""
+        self.fan_angle = 0.0
+
+        # Live metrics (None = veri yok, panelde "—" görünür)
+        self.gpu_name = self.cfg.get("gpu_adi") or self.gpu.name()
+        self.cpu_name = self.cfg.get("cpu_adi") or self.cpu.name()
+        self.game_name = ""
+
+        self.fps = None
+        self.fps_low = None
+        self.fps_avg = None
+        self.frametime_ms = None
+
+        self.fan_pct = 0
+        self.fan_rpm = 0
+        self.gpu_load = 0
+        self.gpu_watt = 0
+        self.gpu_temp = 0
+        self.gpu_mhz = 0
+
+        self.vram_used_mb = 0
+        self.vram_total_mb = 16384
+        self.vram_pct = 0
+
+        self.cpu_load = 0
+        self.core_loads = [0] * max(1, len(self.cpu.cores))
+        self.cpu_watt = 0
+        self.cpu_temp = 0
+        self.cpu_ghz = None
+
+        self.ram_used_gb = 0.0
+        self.ram_total_gb = 0.0
+        self.ram_pct = 0
+        self.ram_speed_label = self.cfg.get("ram_etiketi") or ""
+        self.psu_watt = 0
+        if IS_WIN and store is not None:          # Windows: PresentMon ile kare yakalama (MangoHud yerine)
+            cleanup_old_logs(MANGOHUD_DIR)
+            self.capture = WinFrameCapture(MANGOHUD_DIR, PRESENTMON_EXE, self,
+                                           (self.cfg.get("engelle") or "").split(","))
+            self.capture.start()
+
+    def _reset_fps(self):
+        self.fps_hist.clear()
+        self._log_path = None
+        self._log_pos = 0
+        self._log_cols = None
+        self._log_partial = ""
+        self.session = None
+        self._last_checkpoint = time.monotonic()
+        self.game_name = ""
+        self.fps = self.fps_low = self.fps_avg = self.frametime_ms = None
+
+    @staticmethod
+    def _log_candidates():
+        out = []
+        for path in glob.glob(os.path.join(MANGOHUD_DIR, "*.csv")):
+            if path.endswith("_summary.csv"):
+                continue
+            try:
+                out.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+        return out
+
+    @staticmethod
+    def _program_alive(log_path):
+        """Logu yazan program hâlâ çalışıyor mu? (oyun alt-tab/duraklatmada log yazmayı keser)"""
+        m = LOG_NAME_RE.match(os.path.basename(log_path))
+        prog = (m.group(1) if m else "").lower()
+        if not prog:
+            return False
+        if IS_WIN:
+            ps = _win_psutil()
+            if not ps:
+                return False
+            names = {prog} if prog.endswith(".exe") else {prog, prog + ".exe"}
+            for p in ps.process_iter(["name"]):
+                try:
+                    if (p.info["name"] or "").lower() in names:
+                        return True
+                except Exception:
+                    continue
+            return False
+        for cmd_path in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                with open(cmd_path, "rb") as f:
+                    args = f.read().decode("utf-8", errors="ignore").split("\x00")
+            except OSError:
+                continue
+            # Sadece program yolunun kendisi eşleşsin (ör. Z:\...\Game.exe veya /usr/bin/game)
+            for arg in args[:3]:
+                if arg and os.path.basename(arg.replace("\\", "/")).lower() == prog:
+                    return True
+        return False
+
+    @staticmethod
+    def _superseded(path, cands):
+        """Aynı programın daha sonra başlamış bir logu varsa bu oturum bitmiştir
+        (oyun kapatılıp hemen yeniden açıldığında program 'hâlâ açık' görünür)."""
+        m = LOG_NAME_RE.match(os.path.basename(path))
+        if not m:
+            return False
+        prog, start = m.group(1).lower(), start_ts_from_log(path)
+        for _, other in cands:
+            mo = LOG_NAME_RE.match(os.path.basename(other))
+            if other != path and mo and mo.group(1).lower() == prog and start_ts_from_log(other) > start:
+                return True
+        return False
+
+    def _ended(self, path, mt, cands, now_wall):
+        return now_wall - mt > ORPHAN_STALE_SEC and (
+            self._superseded(path, cands) or not self._program_alive(path))
+
+    def _read_new_rows(self):
+        try:
+            with open(self._log_path, "rb") as f:
+                f.seek(self._log_pos)
+                data = f.read()
+        except OSError:
+            return []
+        self._log_pos += len(data)
+        lines = (self._log_partial + data.decode("utf-8", errors="ignore")).split("\n")
+        self._log_partial = lines.pop()  # yarım kalan son satır
+        rows = []
+        for ln in lines:
+            if self._log_cols is None:
+                self._log_cols = header_columns(ln)
+                continue
+            rec = parse_row(ln, self._log_cols)
+            if rec:
+                rows.append(rec)
+        return rows
+
+    def _save(self, res, finished):
+        if self.store is None:
+            return
+        try:
+            self.store.upsert(res, finished)
+        except Exception as e:
+            print(f"[oyun-izleyici] kayıt hatası: {e}", file=sys.stderr)
+
+    def capturing(self):
+        return self.capture is not None and self.capture._active is not None
+
+    def stop(self):
+        if self.capture is not None:
+            self.capture.stop()
+        if hasattr(self.cpu, "stop"):
+            self.cpu.stop()
+
+    def checkpoint_now(self):
+        """Panel kapanırken süren oturumu yarım olarak kaydet (sonraki açılışta tamamlanır)."""
+        if self.session is not None:
+            res = self.session.result()
+            if res and res["duration_s"] >= MIN_SESSION_SEC:
+                self._save(res, False)
+
+    def _finish_session(self, notify=True):
+        res = self.session.result() if self.session else None
+        if res and res["duration_s"] >= MIN_SESSION_SEC:
+            self._save(res, True)
+            if notify:
+                self.finished_events.append(res)
+        elif self.session and self.store is not None:
+            try:
+                self.store.ignore(self.session.log_file, "kısa oturum")
+            except Exception:
+                pass
+        self._reset_fps()
+
+    def _import_orphans(self, cands):
+        """Panel kapalıyken / başka oyunla aynı anda biten logları sessizce kaydeder."""
+        if self.store is None:
+            return
+        now = time.time()
+        try:
+            self.store.finish_orphans({os.path.basename(p) for _, p in cands},
+                                      os.path.basename(self._log_path) if self._log_path else None)
+            for mt, path in cands:
+                lf = os.path.basename(path)
+                if path == self._log_path or now - mt < ORPHAN_STALE_SEC or self.store.is_done(lf):
+                    continue
+                if game_name_from_log(path) in IGNORED_PROGRAMS:
+                    self.store.ignore(lf, "program")
+                    continue
+                if not self._ended(path, mt, cands, now):
+                    continue
+                res = SessionAccumulator.from_file(path).result()
+                if res and res["duration_s"] >= MIN_SESSION_SEC:
+                    self.store.upsert(res, True)
+                else:
+                    self.store.ignore(lf, "kısa oturum")
+        except Exception as e:
+            print(f"[oyun-izleyici] içe aktarma hatası: {e}", file=sys.stderr)
+
+    def _update_game(self):
+        now_wall = time.time()
+        cands = self._log_candidates()
+        mtimes = {p: mt for mt, p in cands}
+
+        # Mevcut oturum: log durduysa ve program kapandıysa bitir
+        if self._log_path:
+            mt = mtimes.get(self._log_path)
+            if mt is None:
+                self._finish_session()
+            elif self._ended(self._log_path, mt, cands, now_wall):
+                for rec in self._read_new_rows():
+                    self.session.add(rec)
+                self._finish_session()
+
+        # Yeni oturum: en taze, yok sayılmayan log
+        if self._log_path is None:
+            fresh = [(mt, p) for mt, p in cands
+                     if now_wall - mt <= MANGOHUD_STALE_SEC
+                     and game_name_from_log(p) not in IGNORED_PROGRAMS]
+            if fresh:
+                path = max(fresh)[1]
+                self._reset_fps()
+                self._log_path = path
+                self.session = SessionAccumulator(path)
+                self.game_name = self.session.game
+
+        if now_wall - self._last_scan > 30:
+            self._last_scan = now_wall
+            self._import_orphans(cands)
+
+        if self._log_path is None:
+            return
+
+        rows = self._read_new_rows()
+        for rec in rows:
+            self.session.add(rec)
+            self.fps_hist.append((rec["fps"], rec["frametime"], rec.get("gpu_power"), rec.get("gpu_load")))
+
+        live = now_wall - mtimes.get(self._log_path, 0) <= MANGOHUD_STALE_SEC
+        if not live or not self.fps_hist:
+            # Oyun duraklatıldı / alt-tab: değerleri gösterme ama oturumu sürdür
+            self.fps = self.frametime_ms = None
+            return
+
+        self.session.add_panel_sample(self)
+        recent = list(self.fps_hist)[-5:]  # son ~0.5 sn
+        self.fps = int(round(sum(r[0] for r in recent) / len(recent)))
+        self.frametime_ms = recent[-1][1]
+        active_window = [r[0] for r in self.fps_hist
+                         if SessionAccumulator.is_gameplay_frame(r[0], r[2] if len(r) > 2 else self.gpu_watt,
+                                                                 r[3] if len(r) > 3 else self.gpu_load)]
+        active_window = SessionAccumulator.drop_load_runs(active_window)
+        raw_vals = sorted(active_window if len(active_window) >= 15 else (r[0] for r in self.fps_hist))
+        fps_vals = SessionAccumulator.filter_menu_outliers(raw_vals)
+        self.fps_avg = int(round(sum(fps_vals) / len(fps_vals)))
+        n_low = max(1, len(fps_vals) // 100)  # son 60 sn'nin en düşük %1'i
+        self.fps_low = int(round(sum(fps_vals[:n_low]) / n_low))
+
+        # Ara kayıt (elektrik kesilse / panel çökse bile oturum kaybolmaz)
+        if time.monotonic() - self._last_checkpoint >= CHECKPOINT_SEC:
+            self._last_checkpoint = time.monotonic()
+            res = self.session.result()
+            if res and res["duration_s"] >= MIN_SESSION_SEC:
+                self._save(res, False)
+
+    def update(self):
+        # 1-2. Ekran kartı ve işlemci (donanıma göre otomatik)
+        try:
+            self.gpu.read(self)
+        except Exception as e:
+            print(f"[oyun-izleyici] GPU okuma hatası: {e}", file=sys.stderr)
+        try:
+            self.cpu.read(self)
+        except Exception as e:
+            print(f"[oyun-izleyici] CPU okuma hatası: {e}", file=sys.stderr)
+        self.on_ac = read_power_source()
+
+        # 3. RAM Metrics
+        if IS_WIN:
+            try:
+                win_read_memory(self)
+            except Exception:
+                pass
+        try:
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        k = parts[0].strip()
+                        v = int(parts[1].strip().split()[0])
+                        mem[k] = v
+            total_kb = mem["MemTotal"]
+            avail_kb = mem["MemAvailable"]
+            used_kb = max(0, total_kb - avail_kb)
+            self.ram_used_gb = used_kb / (1024 * 1024)
+            self.ram_total_gb = total_kb / (1024 * 1024)
+            self.ram_pct = int(round((used_kb / max(1, total_kb)) * 100))
+        except Exception:
+            pass
+
+        # 3.5. PSU Toplam Çekilen Güç (Watt) Hesabı
+        gw = self.gpu_watt or 0
+        cw = self.cpu_watt or 0
+        base_overhead = 15 if self.on_ac is not None else 35
+        raw_dc = gw + cw + base_overhead
+        self.psu_watt = int(round(raw_dc * 1.08))
+
+        # 4. Aktif oyun + FPS / 1% Low / Avg / Frametime + oturum kaydı (MangoHud logundan)
+        self._update_game()
+
+
+# =============================================================================
+# OYUN GEÇMİŞİ PENCERESİ (sağ üstteki ⋮ butonu)
+# =============================================================================
+HISTORY_STYLE = """
+QWidget { background-color: #070b09; color: #f2f7f3; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; font-size: 13px; }
+QLabel#title { color: #40ff70; font-size: 22px; font-weight: 900; }
+QLabel#totals { color: #ffffff; font-size: 15px; font-weight: 700; }
+QLabel#gameSummary { color: #40ff70; font-size: 14px; font-weight: 700; padding: 6px;
+                     border: 1px solid #24402e; border-radius: 6px; background: #0b140f; }
+QLabel#footer { color: #7d9a86; font-size: 11px; }
+QTabWidget::pane { border: 1px solid #24402e; border-radius: 6px; }
+QTabBar::tab { background: #0c1410; color: #a9c4b1; padding: 8px 18px; font-weight: 700;
+               border: 1px solid #24402e; border-bottom: none; border-top-left-radius: 6px;
+               border-top-right-radius: 6px; margin-right: 2px; }
+QTabBar::tab:selected { background: #15291c; color: #40ff70; }
+QTableWidget { background: #090f0c; alternate-background-color: #0d1611; gridline-color: #1b2e22;
+               border: none; selection-background-color: #1b3b26; selection-color: #40ff70; }
+QHeaderView::section { background: #0f1c14; color: #40ff70; font-weight: 800; padding: 6px;
+                       border: none; border-right: 1px solid #1b2e22; border-bottom: 1px solid #24402e; }
+QPushButton { background: #0f1c14; color: #ffffff; border: 1px solid #2d5c3b; border-radius: 6px;
+              padding: 7px 14px; font-weight: 700; }
+QPushButton:hover { background: #1b3b26; color: #40ff70; }
+QPushButton#danger { border-color: #7a2a2a; }
+QPushButton#danger:hover { background: #3b1414; color: #ff6b6b; }
+QComboBox { background: #0f1c14; border: 1px solid #2d5c3b; border-radius: 6px; padding: 5px 10px;
+            font-weight: 700; min-width: 220px; }
+QComboBox QAbstractItemView { background: #0c1410; selection-background-color: #1b3b26; }
+"""
+
+
+def _num(v, d=0, suffix=""):
+    if v is None:
+        return "—"
+    return f"{v:.{d}f}{suffix}"
+
+
+def _date(ts, with_time=True):
+    if not ts:
+        return "—"
+    return time.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y", time.localtime(ts))
+
+
+class HistoryWindow(QWidget):
+    def __init__(self, store, sync=None):
+        from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QTableWidget,
+                                       QPushButton, QComboBox, QAbstractItemView, QHeaderView, QCheckBox)
+        super().__init__()
+        self.store = store
+        self.sync = sync
+        self.setWindowTitle("Oyun Geçmişi — Oyun İzleyici")
+        self.setStyleSheet(HISTORY_STYLE)
+        self.resize(1240, 700)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(10)
+
+        top = QHBoxLayout()
+        title = QLabel("OYUN GEÇMİŞİ")
+        title.setObjectName("title")
+        top.addWidget(title)
+        top.addSpacing(20)
+        top.addWidget(QLabel("PC:"))
+        self.pc_combo = QComboBox()
+        self.pc_combo.currentIndexChanged.connect(self._fill_all)
+        top.addWidget(self.pc_combo)
+        top.addStretch(1)
+        self.totals_lbl = QLabel()
+        self.totals_lbl.setObjectName("totals")
+        top.addWidget(self.totals_lbl)
+        root.addLayout(top)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        # --- Sekme 1: Oyunlar (oyun başına toplam + ortalama) ---
+        self.games_tbl = QTableWidget(0, 9)
+        self.games_tbl.setHorizontalHeaderLabels([
+            "Oyun", "Toplam Süre", "Oturum", "Ort. FPS", "Ort. 1% Low", "En İyi Ort. FPS",
+            "GPU Maks °C", "İlk Oynama", "Son Oynama"])
+        self.tabs.addTab(self.games_tbl, "Oyunlar (Toplam)")
+        self.games_tbl.cellDoubleClicked.connect(self._open_game_sessions)
+
+        # --- Sekme 2: Oturumlar (her açılış ayrı) ---
+        sess_page = QWidget()
+        sv = QVBoxLayout(sess_page)
+        sv.setContentsMargins(8, 10, 8, 8)
+        fl = QHBoxLayout()
+        fl.addWidget(QLabel("Oyun:"))
+        self.game_combo = QComboBox()
+        self.game_combo.currentIndexChanged.connect(self._fill_sessions)
+        fl.addWidget(self.game_combo)
+        fl.addStretch(1)
+        hint = QLabel("Not eklemek için 'Not' hücresine çift tıkla")
+        hint.setObjectName("footer")
+        fl.addWidget(hint)
+        sv.addLayout(fl)
+        self.game_summary = QLabel()
+        self.game_summary.setObjectName("gameSummary")
+        self.game_summary.setWordWrap(True)
+        sv.addWidget(self.game_summary)
+        self.SESS_COLS = ["Tarih", "PC", "Oyun", "Süre", "Ort. FPS", "1% Low", "0.1% Low", "Maks FPS",
+                          "Frametime", "GPU °C ort/maks", "GPU W", "CPU °C ort/maks", "CPU W", "VRAM Maks",
+                          "Güç", "Not"]
+        self.sess_tbl = QTableWidget(0, len(self.SESS_COLS))
+        self.sess_tbl.setHorizontalHeaderLabels(self.SESS_COLS)
+        self.sess_tbl.cellDoubleClicked.connect(self._edit_note)
+        sv.addWidget(self.sess_tbl, 1)
+        self.tabs.addTab(sess_page, "Oturumlar (Tek Tek)")
+
+        # --- Sekme 3: PC Karşılaştırma ---
+        cmp_page = QWidget()
+        cv = QVBoxLayout(cmp_page)
+        cv.setContentsMargins(8, 10, 8, 8)
+        cl = QHBoxLayout()
+        cl.addWidget(QLabel("A:"))
+        self.cmp_a = QComboBox()
+        cl.addWidget(self.cmp_a)
+        cl.addSpacing(10)
+        cl.addWidget(QLabel("B:"))
+        self.cmp_b = QComboBox()
+        cl.addWidget(self.cmp_b)
+        cl.addSpacing(16)
+        self.cmp_ac = QCheckBox("Laptopta sadece prizde oynanan oturumlar")
+        self.cmp_ac.setChecked(True)
+        cl.addWidget(self.cmp_ac)
+        cl.addStretch(1)
+        cv.addLayout(cl)
+        cards = QHBoxLayout()
+        self.cmp_card_a = QLabel()
+        self.cmp_card_b = QLabel()
+        for c in (self.cmp_card_a, self.cmp_card_b):
+            c.setObjectName("gameSummary")
+            c.setWordWrap(True)
+            cards.addWidget(c, 1)
+        cv.addLayout(cards)
+        self.cmp_tbl = QTableWidget(0, 12)
+        self.cmp_tbl.setHorizontalHeaderLabels([
+            "Ortak Oyun", "A Süre", "B Süre", "A Ort. FPS", "B Ort. FPS", "FPS Farkı",
+            "A 1% Low", "B 1% Low", "Low Farkı", "A GPU °C", "B GPU °C", "A / B GPU W"])
+        cv.addWidget(self.cmp_tbl, 1)
+        self.cmp_note = QLabel("Not: Karşılaştırma ancak iki PC'de aynı çözünürlük ve grafik ayarıyla "
+                               "oynandıysa adildir. Oturumlara not ekleyerek ayarları kaydedebilirsin.")
+        self.cmp_note.setObjectName("footer")
+        self.cmp_note.setWordWrap(True)
+        cv.addWidget(self.cmp_note)
+        self.tabs.addTab(cmp_page, "PC Karşılaştırma")
+        for w in (self.cmp_a, self.cmp_b):
+            w.currentIndexChanged.connect(self._fill_compare)
+        self.cmp_ac.toggled.connect(self._fill_compare)
+
+        for tbl in (self.games_tbl, self.sess_tbl, self.cmp_tbl):
+            tbl.horizontalHeader().sectionClicked.connect(lambda _c, t=tbl: setattr(t, "_user_sorted", True))
+            tbl.setAlternatingRowColors(True)
+            tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setSortingEnabled(True)
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.games_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.sess_tbl.horizontalHeader().setSectionResizeMode(len(self.SESS_COLS) - 1, QHeaderView.ResizeMode.Stretch)
+        self.cmp_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        btns = QHBoxLayout()
+        b_del = QPushButton("Seçili Oturumu Sil")
+        b_del.setObjectName("danger")
+        b_del.clicked.connect(self._delete_selected)
+        b_csv = QPushButton("CSV Olarak Dışa Aktar")
+        b_csv.clicked.connect(self._export_csv)
+        b_bak = QPushButton("Şimdi Yedekle")
+        b_bak.clicked.connect(self._backup_now)
+        b_sync = QPushButton("GitHub ile Senkronize Et")
+        b_sync.clicked.connect(self._sync_now)
+        self.b_upd = QPushButton("⬆ Uygulamayı Şimdi Güncelle")
+        self.b_upd.setStyleSheet("QPushButton { background: #184226; color: #40ff70; border: 1px solid #40ff70; } "
+                                 "QPushButton:hover { background: #246339; color: #ffffff; }")
+        self.b_upd.clicked.connect(lambda: apply_app_update())
+        self.b_upd.setVisible(bool(self.sync and self.sync.update_available))
+        b_dir = QPushButton("Kayıt Klasörünü Aç")
+        b_dir.clicked.connect(self._open_folder)
+        b_help = QPushButton("📖 Kısayollar ve Rehber")
+        b_help.clicked.connect(lambda: show_shortcuts_guide(self))
+        b_ref = QPushButton("Yenile")
+        b_ref.clicked.connect(self.refresh)
+        for b in (b_del, b_csv, b_bak, b_sync, self.b_upd, b_dir, b_help):
+            btns.addWidget(b)
+        btns.addStretch(1)
+        btns.addWidget(b_ref)
+        root.addLayout(btns)
+
+        self.sync_lbl = QLabel()
+        self.sync_lbl.setObjectName("totals")
+        root.addWidget(self.sync_lbl)
+        self.footer = QLabel()
+        self.footer.setObjectName("footer")
+        root.addWidget(self.footer)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh)
+        self.refresh_timer.start(30000)
+        self.refresh()
+
+    # --- yardımcılar ---
+    @staticmethod
+    def _item(text, sort_key=None, align_right=True):
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        class _Item(QTableWidgetItem):
+            def __lt__(self, other):
+                a = self.data(Qt.ItemDataRole.UserRole)
+                b = other.data(Qt.ItemDataRole.UserRole)
+                if a is None or b is None:
+                    return super().__lt__(other)
+                return a < b
+
+        it = _Item(text)
+        it.setData(Qt.ItemDataRole.UserRole, sort_key if sort_key is not None else -1e18)
+        if align_right:
+            it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return it
+
+    def _fill_table(self, tbl, rows, default_sort):
+        hdr = tbl.horizontalHeader()
+        col, order = (hdr.sortIndicatorSection(), hdr.sortIndicatorOrder()) \
+            if getattr(tbl, "_user_sorted", False) else default_sort
+        tbl.setSortingEnabled(False)
+        tbl.setRowCount(len(rows))
+        for r, cells in enumerate(rows):
+            for c, it in enumerate(cells):
+                tbl.setItem(r, c, it)
+        tbl.setSortingEnabled(True)
+        tbl.sortByColumn(col, order)
+
+    def _machine(self):
+        return self.pc_combo.currentData()
+
+    def _names(self):
+        return {m["machine_id"]: m["name"] or m["machine_id"] for m in self.store.machines()}
+
+    @staticmethod
+    def _reset_combo(combo, items, keep, default_index=0):
+        cur = combo.currentData() if keep else None
+        combo.blockSignals(True)
+        combo.clear()
+        for text, data in items:
+            combo.addItem(text, data)
+        idx = combo.findData(cur) if cur is not None else -1
+        combo.setCurrentIndex(idx if idx >= 0 else min(default_index, combo.count() - 1))
+        combo.blockSignals(False)
+
+    # --- doldurma ---
+    def refresh(self):
+        try:
+            machines = self.store.machines()
+        except Exception as e:
+            self.totals_lbl.setText(f"Kayıt okunamadı: {e}")
+            return
+        own = self.store.machine_id
+        items = [("Tüm PC'ler", None)] + [
+            (f"{m['name'] or m['machine_id']}{'  (bu PC)' if m['machine_id'] == own else ''}", m["machine_id"])
+            for m in machines]
+        self._reset_combo(self.pc_combo, items, keep=True)
+        pcs = [(f"{m['name'] or m['machine_id']}", m["machine_id"]) for m in machines]
+        self._reset_combo(self.cmp_a, pcs, keep=True, default_index=0)
+        self._reset_combo(self.cmp_b, pcs, keep=True, default_index=1)
+        self._fill_all()
+
+    def _fill_all(self):
+        machine = self._machine()
+        try:
+            tot = self.store.totals(machine)
+            games = self.store.game_totals(machine)
+        except Exception as e:
+            self.totals_lbl.setText(f"Kayıt okunamadı: {e}")
+            return
+        self.totals_lbl.setText(
+            f"Toplam oyun süresi: {fmt_duration(tot['secs'])}   ·   {tot['games']} oyun   ·   {tot['sessions']} oturum")
+
+        I = self._item
+        rows = []
+        for g in games:
+            rows.append([
+                I(g["game"], g["game"], align_right=False),
+                I(fmt_duration(g["secs"]), g["secs"]),
+                I(str(g["sessions"]), g["sessions"]),
+                I(_num(g["avg_fps"]), g["avg_fps"]),
+                I(_num(g["low1"]), g["low1"]),
+                I(_num(g["best_avg"]), g["best_avg"]),
+                I(_num(g["gpu_temp_max"], 0, " °C"), g["gpu_temp_max"]),
+                I(_date(g["first_ts"], False), g["first_ts"]),
+                I(_date(g["last_ts"]), g["last_ts"]),
+            ])
+        self._fill_table(self.games_tbl, rows, (1, Qt.SortOrder.DescendingOrder))
+
+        self._reset_combo(self.game_combo, [("Tüm oyunlar", None)] +
+                          [(g, g) for g in sorted(r["game"] for r in games)], keep=True)
+        self._fill_sessions()
+        self._fill_compare()
+
+        if self.sync is not None:
+            self.sync_lbl.setText(self.sync.status_text())
+            self.b_upd.setVisible(bool(self.sync.update_available))
+        backups = self.store.list_backups()
+        last_bak = os.path.basename(backups[-1]) if backups else "yok"
+        self.footer.setText(f"Bu PC: {self._names().get(self.store.machine_id)} ({self.store.machine_id})   ·   "
+                            f"Kayıt: {self.store.path}   ·   Son yedek: {last_bak} ({len(backups)} yedek)   ·   "
+                            f"{MIN_SESSION_SEC // 60} dk'dan kısa açılışlar kaydedilmez")
+
+    def _fill_sessions(self):
+        game = self.game_combo.currentData()
+        machine = self._machine()
+        names = self._names()
+        try:
+            sessions = self.store.sessions(game, machine)
+        except Exception:
+            return
+        if game:
+            g = self.store.game_total(game, machine)
+            if g:
+                where = names.get(machine, "tüm PC'ler") if machine else "tüm PC'ler"
+                self.game_summary.setText(
+                    f"{game} ({where})  —  Toplam {fmt_duration(g['secs'])}  ·  {g['sessions']} oturum  ·  "
+                    f"Ort. {_num(g['avg_fps'])} FPS  ·  Ort. 1% Low {_num(g['low1'])}  ·  "
+                    f"En iyi oturum {_num(g['best_avg'])} FPS  ·  En kötü 0.1% Low {_num(g['worst_low01'])}  ·  "
+                    f"GPU maks {_num(g['gpu_temp_max'], 0, ' °C')}  ·  CPU maks {_num(g['cpu_temp_max'], 0, ' °C')}")
+            self.game_summary.show()
+        else:
+            self.game_summary.hide()
+
+        I = self._item
+        rows = []
+        for s in sessions:
+            dur = fmt_duration(s["duration_s"]) + ("" if s["finished"] else "  (sürüyor)")
+            first = I(_date(s["start_ts"]), s["start_ts"], align_right=False)
+            first.setData(Qt.ItemDataRole.UserRole + 1, s["id"])
+            first.setData(Qt.ItemDataRole.UserRole + 2, s["machine_id"])
+            ac = s["ac_ratio"]
+            power = "—" if ac is None else ("Priz" if ac >= 0.9 else "Pil" if ac <= 0.1 else f"Karışık (%{ac * 100:.0f} priz)")
+            rows.append([
+                first,
+                I(names.get(s["machine_id"], s["machine_id"]), names.get(s["machine_id"], ""), align_right=False),
+                I(s["game"], s["game"], align_right=False),
+                I(dur, s["duration_s"]),
+                I(_num(s["avg_fps"]), s["avg_fps"]),
+                I(_num(s["low1"]), s["low1"]),
+                I(_num(s["low01"]), s["low01"]),
+                I(_num(s["max_fps"]), s["max_fps"]),
+                I(_num(s["avg_ft"], 1, " ms"), s["avg_ft"]),
+                I(f"{_num(s['gpu_temp_avg'])} / {_num(s['gpu_temp_max'])}", s["gpu_temp_max"]),
+                I(_num(s["gpu_w_avg"], 0, " W"), s["gpu_w_avg"]),
+                I(f"{_num(s['cpu_temp_avg'])} / {_num(s['cpu_temp_max'])}", s["cpu_temp_max"]),
+                I(_num(s["cpu_w_avg"], 0, " W"), s["cpu_w_avg"]),
+                I(_num(s["vram_max_mb"], 0, " MB"), s["vram_max_mb"]),
+                I(power, -1 if ac is None else ac, align_right=False),
+                I(s["note"] or "", s["note"] or "", align_right=False),
+            ])
+        self._fill_table(self.sess_tbl, rows, (0, Qt.SortOrder.DescendingOrder))
+
+    def _fill_compare(self):
+        a, b = self.cmp_a.currentData(), self.cmp_b.currentData()
+        names = self._names()
+        machines = {m["machine_id"]: m for m in self.store.machines()}
+        ac_only = self.cmp_ac.isChecked()
+
+        def card(mid):
+            m = machines.get(mid, {})
+            t = self.store.totals(mid)
+            hw = " · ".join(x for x in (m.get("cpu"), m.get("gpu"), m.get("ram")) if x)
+            return (f"{names.get(mid, mid)}\n{hw or 'donanım bilgisi yok'}\n"
+                    f"Toplam {fmt_duration(t['secs'])} · {t['games']} oyun · {t['sessions']} oturum")
+        if a:
+            self.cmp_card_a.setText("A — " + card(a))
+        if b:
+            self.cmp_card_b.setText("B — " + card(b))
+        if not a or not b or a == b:
+            self._fill_table(self.cmp_tbl, [], (0, Qt.SortOrder.AscendingOrder))
+            return
+        ga = {r["game"]: r for r in self.store.game_totals(a, ac_only)}
+        gb = {r["game"]: r for r in self.store.game_totals(b, ac_only)}
+
+        def diff(x, y):
+            if not x or not y:
+                return "—", None
+            d = (x - y) / y * 100
+            return (f"A %{abs(d):.0f} {'önde' if d >= 0 else 'geride'}", d)
+        I = self._item
+        rows = []
+        for game in sorted(set(ga) & set(gb)):
+            ra, rb = ga[game], gb[game]
+            fd, fdv = diff(ra["avg_fps"], rb["avg_fps"])
+            ld, ldv = diff(ra["low1"], rb["low1"])
+            fi = I(fd, fdv)
+            li = I(ld, ldv)
+            for it, v in ((fi, fdv), (li, ldv)):
+                if v is not None:
+                    it.setForeground(QColor(64, 255, 112) if v >= 0 else QColor(255, 107, 107))
+            rows.append([
+                I(game, game, align_right=False),
+                I(fmt_duration(ra["secs"]), ra["secs"]), I(fmt_duration(rb["secs"]), rb["secs"]),
+                I(_num(ra["avg_fps"]), ra["avg_fps"]), I(_num(rb["avg_fps"]), rb["avg_fps"]), fi,
+                I(_num(ra["low1"]), ra["low1"]), I(_num(rb["low1"]), rb["low1"]), li,
+                I(_num(ra["gpu_temp_avg"], 0, " °C"), ra["gpu_temp_avg"]),
+                I(_num(rb["gpu_temp_avg"], 0, " °C"), rb["gpu_temp_avg"]),
+                I(f"{_num(ra['gpu_w_avg'], 0)} / {_num(rb['gpu_w_avg'], 0)} W", ra["gpu_w_avg"]),
+            ])
+        self._fill_table(self.cmp_tbl, rows, (0, Qt.SortOrder.AscendingOrder))
+        only = len(set(ga) ^ set(gb))
+        self.cmp_note.setText(
+            f"{len(rows)} ortak oyun ({only} oyun sadece birinde oynanmış). Süre ağırlıklı ortalamalar. "
+            "Karşılaştırma ancak iki PC'de aynı çözünürlük ve grafik ayarıyla oynandıysa adildir; "
+            "oturumlara not ekleyerek ayarları kaydedebilirsin.")
+
+    def _open_game_sessions(self, row, _col):
+        it = self.games_tbl.item(row, 0)
+        if it:
+            idx = self.game_combo.findData(it.text())
+            if idx >= 0:
+                self.game_combo.setCurrentIndex(idx)
+            self.tabs.setCurrentIndex(1)
+
+    # --- işlemler ---
+    def _selected_session(self):
+        row = self.sess_tbl.currentRow()
+        it = self.sess_tbl.item(row, 0) if row >= 0 else None
+        if it is None:
+            return None
+        return (it.data(Qt.ItemDataRole.UserRole + 1), it.data(Qt.ItemDataRole.UserRole + 2), row, it)
+
+    def _edit_note(self, row, col):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        if col != len(self.SESS_COLS) - 1:
+            return
+        it = self.sess_tbl.item(row, 0)
+        sid, mid = it.data(Qt.ItemDataRole.UserRole + 1), it.data(Qt.ItemDataRole.UserRole + 2)
+        if mid != self.store.machine_id:
+            QMessageBox.information(self, "Not", "Başka bir PC'nin oturumuna not o PC'den eklenebilir.")
+            return
+        cur = self.sess_tbl.item(row, col).text()
+        text, ok = QInputDialog.getText(self, "Oturum Notu",
+                                        "Not (ör. 1440p Ultra, DLSS Kalite, FSR kapalı):", text=cur)
+        if ok:
+            self.store.set_note(sid, text)
+            if self.sync:
+                self.sync.request()
+            self._fill_sessions()
+
+    def _delete_selected(self):
+        from PySide6.QtWidgets import QMessageBox
+        sel = self._selected_session() if self.tabs.currentIndex() == 1 else None
+        if sel is None:
+            QMessageBox.information(self, "Oturum Sil", "Silmek için 'Oturumlar' sekmesinde bir satır seç.")
+            return
+        sid, mid, row, it = sel
+        if mid != self.store.machine_id:
+            QMessageBox.information(self, "Oturum Sil", "Başka bir PC'nin oturumu sadece o PC'den silinebilir.")
+            return
+        game = self.sess_tbl.item(row, 2).text()
+        ans = QMessageBox.question(
+            self, "Oturumu Sil",
+            f"{game} — {it.text()} oturumu silinsin mi?\n\n"
+            "Bu oturum toplamlardan ve GitHub'daki kayıttan çıkar. (Yerel yedeklerde ve depo geçmişinde "
+            "kopyası durmaya devam eder.)")
+        if ans == QMessageBox.StandardButton.Yes:
+            self.store.backup_if_needed(force=True)  # silmeden önce taze yedek
+            self.store.delete_session(sid)
+            if self.sync:
+                self.sync.request()
+            self.refresh()
+
+    def _export_csv(self):
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        default = os.path.join(os.path.expanduser("~"), time.strftime("oyun-gecmisi-%Y-%m-%d.csv"))
+        path, _ = QFileDialog.getSaveFileName(self, "CSV Olarak Kaydet", default, "CSV (*.csv)")
+        if path:
+            self.store.export_csv(path)
+            QMessageBox.information(self, "Dışa Aktarıldı", f"Kaydedildi:\n{path}")
+
+    def _backup_now(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.store.backup_if_needed(force=True)
+        self.refresh()
+        QMessageBox.information(self, "Yedek", "Yedek alındı:\n" + self.store.list_backups()[-1])
+
+    def _sync_now(self):
+        from PySide6.QtWidgets import QMessageBox
+        if self.sync is None or not self.sync.enabled:
+            QMessageBox.information(self, "GitHub", "Bu PC'de GitHub senkronu kurulmamış.\n"
+                                    f"Kurulum için depodaki kur.sh betiğini çalıştır ({REPO_DIR}).")
+            return
+        self.sync.request()
+        self.sync_lbl.setText("GitHub: senkronize ediliyor…")
+
+    def _open_folder(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR))
+
+
+def show_shortcuts_guide(parent=None, accent_hex="#40ff70"):
+    from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Kısayollar ve Kullanım Rehberi — Oyun İzleyici")
+    dlg.resize(560, 520)
+    dlg.setStyleSheet(f"""
+        QDialog {{ background-color: #070b09; color: #f2f7f3; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; }}
+        QLabel#hdr {{ color: {accent_hex}; font-size: 19px; font-weight: 900; padding-bottom: 4px; }}
+        QLabel#body {{ color: #e4efe7; font-size: 13px; line-height: 1.45; }}
+        QPushButton {{ background: #0f1c14; color: #ffffff; border: 1px solid {accent_hex};
+                       border-radius: 6px; padding: 8px 20px; font-weight: 800; }}
+        QPushButton:hover {{ background: #1b3b26; color: {accent_hex}; }}
+    """)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(20, 18, 20, 16)
+    lay.setSpacing(12)
+
+    hdr = QLabel("📖 KISAYOLLAR VE KULLANIM REHBERİ")
+    hdr.setObjectName("hdr")
+    lay.addWidget(hdr)
+
+    guide_html = f"""
+    <div style="line-height:1.55;">
+      <p><b style="color:{accent_hex};">🖱️ PANEL KONTROLLERİ &amp; FARE KISAYOLLARI</b><br>
+      • <b>Sol Üst Ayarlar Çarkı (⚙) veya Sağ Tık:</b> Ayarlar, Tema Rengi, Oyun Geçmişi ve MangoHud menüsünü açar.<br>
+      • <b>Sol Tık + Sürükle:</b> Paneli ekranda istediğin yere taşır (konumu otomatik kaydedilir).<br>
+      • <b>Fare Tekerleği (Yukarı / Aşağı):</b> Panelin boyutunu büyütür veya küçültür (<code>%70 – %150</code>).<br>
+      • <b>Ctrl + Fare Tekerleği:</b> <b>Arka Plan &amp; Çizgi Saydamlığını</b> ayarlar (<code>%0 Tam Şeffaf – %100 Opak</code>).<br>
+      &nbsp;&nbsp;<i>Not: Saydamlık kısıldığında yazılar, FPS sayıları ve grafikler %100 net/opak kalır; sadece siyah arka plan ve çerçeve çizgileri şeffaflaşır!</i></p>
+
+      <p><b style="color:{accent_hex};">🎮 OYUN İÇİ GÖSTERGE (MANGOHUD) KISAYOLLARI</b><br>
+      • <b>Sağ Shift + F12:</b> Oyun içindeyken MangoHud FPS göstergesini anında gizler veya gösterir.<br>
+      • <b>Otomatik Kayıt &amp; Akıllı Menü Filtresi:</b> MangoHud gizli modda olsa bile arka planda FPS kaydedilir. Menü ve yükleme ekranlarındaki 1000+ FPS patlamaları otomatik filtrelenerek sadece gerçek 3D oyun içi ortalaman (<code>AVG</code> ve <code>1% LOW</code>) hesaplanır.</p>
+
+      <p><b style="color:{accent_hex};">📊 OYUN GEÇMİŞİ &amp; SENKRONİZASYON</b><br>
+      • <b>Not Ekleme:</b> Oyun Geçmişi &rarr; <i>Oturumlar</i> sekmesinde bir oturumun <b>Not</b> hücresine çift tıklayarak çözünürlük/ayar notu (ör. <i>1440p Ultra, FSR Kalite</i>) ekleyebilirsin.<br>
+      • <b>Oyun Detayı:</b> <i>Oyunlar (Toplam)</i> sekmesinde bir oyuna çift tıklayarak o oyunun tüm oturumlarını açabilirsin.<br>
+      • <b>Tek Tıkla Güncelleme:</b> GitHub'a yeni sürüm geldiğinde panelin en altında <b style="color:{accent_hex};">⬆ GÜNCELLEME VAR</b> butonu çıkar; tıkladığında otomatik güncellenir.<br></p>
+    </div>
+    """
+    body = QLabel(guide_html)
+    body.setObjectName("body")
+    body.setWordWrap(True)
+    lay.addWidget(body, 1)
+
+    btn = QPushButton("Anladım, Kapat")
+    btn.clicked.connect(dlg.accept)
+    lay.addWidget(btn)
+    dlg.exec()
+
+class HudWindow(QWidget):
+    DOTS_RECT = QRectF(4, 4, 24, 24)        # sol üstteki küçük ayarlar çarkı menü butonu
+    UPDATE_RECT = QRectF(8, 738, 374, 26)  # güncelleme varsa alt bilgi satırı tıklanabilir alan
+
+    def __init__(self, store=None, store_error=None, mode="panel"):
+        super().__init__()
+        self.store = store
+        self.mode = mode
+        self.sync = None
+        self.tray = None
+        self.history_win = None
+        self.summary = None          # oyun bitince gösterilen özet
+        self.summary_until = 0.0
+        self.dots_hover = False
+        self.update_hover = False
+        self.setMouseTracking(True)
+        self.telemetry = HardwareTelemetry(store)
+        self.telemetry.update()
+        if store is not None:
+            ensure_mangohud_gpu(self.telemetry.gpu)
+            t = self.telemetry
+            phys = next((g for g in (4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
+                         if g >= t.ram_total_gb), round(t.ram_total_gb))  # kullanılabilir -> fiziksel
+            ram = f"{phys} GB" + (f" {t.ram_speed_label}" if t.ram_speed_label else "")
+            self.sync = SyncManager(store, t.cfg, {
+                "gpu": t.gpu_name, "cpu": t.cpu_name, "ram": ram, "os": _os_name(),
+                "has_battery": t.on_ac is not None})
+        if store_error:
+            notify("Oyun İzleyici: kayıt açılamadı", str(store_error))
+        elif store is not None and store.recovered_from:
+            notify("Oyun İzleyici: kayıt onarıldı",
+                   f"Bozuk kayıt dosyası kenara alındı, yedekten geri yüklendi:\n{store.recovered_from}")
+
+        self._font_cache = {}
+        self.settings = QSettings("oyun-izleyici", "panel")
+        self.always_on_top = self.settings.value("always_on_top", True, type=bool)
+        self.scale_factor = min(1.5, max(0.7, self.settings.value("scale", 1.0, type=float)))
+        self.base_w = 390
+        self.base_h = 770
+        self.drag_pos = None
+        self.opacity = min(1.0, max(0.0, self.settings.value("opacity", 1.0, type=float)))
+        self.accent_hex = self.settings.value("accent_color", "#40ff70", type=str) or "#40ff70"
+        if not QColor(self.accent_hex).isValid():
+            self.accent_hex = "#40ff70"
+        self.overlay = {
+            "mode": self.settings.value("overlay_mode", "kendi", type=str),
+            "pos": self.settings.value("overlay_pos", "top-center", type=str),
+            "bg": self.settings.value("overlay_bg", 0.3, type=float),
+            "size": self.settings.value("overlay_size", 20, type=int),
+        }
+        self.setWindowOpacity(1.0)
+        self._setup_tray()
+
+        self.setWindowTitle("Canlı Oyun & Donanım İzleyici")
+        self._apply_window_flags()
+        self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
+        saved_pos = self.settings.value("pos", None, type=QPoint)
+        if saved_pos is not None and QGuiApplication.screenAt(saved_pos + QPoint(20, 20)) is not None:
+            self.move(saved_pos)
+        else:
+            self.move_to_left_hdmi_monitor()
+
+        # Sensor update timer (500 ms)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._on_tick)
+        self.timer.start(500)
+
+        # Fan animasyonu: sadece fan dönerken, sadece ikon alanını yeniden çizer (10 Hz)
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self._on_anim)
+        self.anim_timer.start(100)
+
+    def _font(self, size):
+        f = self._font_cache.get(size)
+        if f is None:
+            f = make_font(size)
+            self._font_cache[size] = f
+        return f
+
+    def save_settings(self):
+        if "--snapshot" in sys.argv:
+            return
+        self.settings.setValue("pos", self.pos())
+        self.settings.setValue("scale", self.scale_factor)
+        self.settings.setValue("always_on_top", self.always_on_top)
+        self.settings.setValue("opacity", self.opacity)
+        self.settings.setValue("accent_color", self.accent_hex)
+        for k, v in self.overlay.items():
+            self.settings.setValue(f"overlay_{k}", v)
+        self.settings.sync()
+
+    def set_accent_color(self, hex_code):
+        c = QColor(hex_code)
+        if c.isValid():
+            self.accent_hex = c.name()
+            self.save_settings()
+            self.update()
+
+    def pick_accent_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(QColor(self.accent_hex), self, "Panel Tema Rengini Seç (Renk Çarkı)")
+        if c.isValid():
+            self.set_accent_color(c.name())
+
+    def _add_color_menu(self, menu):
+        presets = [
+            ("#40ff70", "🟢 Neon Yeşil (Varsayılan)"),
+            ("#00e5ff", "🩵 Siber Camgöbeği (Cyan)"),
+            ("#ffb300", "🟡 Kehribar Sarı (Amber)"),
+            ("#ff3d71", "🔴 Kızıl / Pembe (Crimson)"),
+            ("#a855f7", "🟣 Elektrik Mor (Purple)"),
+            ("#38bdf8", "🔵 Buz Mavisi (Ice Blue)"),
+            ("#ff6b00", "🟠 Turuncu (MSI / Ryzen)"),
+            ("#ffffff", "⚪ Saf Beyaz (Monokrom)"),
+        ]
+        sub = menu.addMenu("🎨 Tema Rengi / Renk Çarkı…")
+        for hx, label in presets:
+            act = sub.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self.accent_hex.lower() == hx.lower())
+            act.triggered.connect(lambda _=False, v=hx: self.set_accent_color(v))
+        sub.addSeparator()
+        act_wheel = sub.addAction("🌈 Özel Renk Çarkı Aç…")
+        act_wheel.triggered.connect(self.pick_accent_color)
+
+    def _set_scale(self, factor):
+        self.scale_factor = factor
+        self.resize(int(self.base_w * factor), int(self.base_h * factor))
+        self.update()
+        self.save_settings()
+
+    def _apply_window_flags(self):
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        if self.always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowOpacity(1.0)
+
+    def move_to_left_hdmi_monitor(self):
+        screens = QGuiApplication.screens()
+        target_screen = None
+        for s in screens:
+            if "HDMI" in s.name().upper() or s.geometry().x() == 0:
+                target_screen = s
+                break
+        if target_screen is None and screens:
+            target_screen = min(screens, key=lambda s: s.geometry().x())
+
+        if target_screen:
+            geo = target_screen.geometry()
+            # Sol monitörün sağ-orta kısmına veya sol üstüne şık şekilde yerleştir
+            x = geo.x() + geo.width() - self.width() - 30
+            y = geo.y() + (geo.height() - self.height()) // 2
+            self.move(x, y)
+            self.save_settings()
+
+    def _setup_tray(self):
+        from PySide6.QtWidgets import QSystemTrayIcon
+        from PySide6.QtGui import QIcon, QPixmap
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QIcon.fromTheme("applications-games")
+        if icon.isNull():
+            pm = QPixmap(64, 64)
+            pm.fill(QColor(6, 9, 8))
+            qp = QPainter(pm)
+            qp.setPen(QColor(64, 255, 112))
+            qp.setFont(make_font(26))
+            qp.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "FPS")
+            qp.end()
+            icon = QIcon(pm)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("Oyun İzleyici")
+        menu = QMenu()
+        menu.aboutToShow.connect(lambda: self._fill_tray_menu(menu))  # işaretler her açılışta güncel
+        self._fill_tray_menu(menu)
+        self._tray_menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self.open_history() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.show()
+        global _NOTIFY_TRAY
+        _NOTIFY_TRAY = self.tray            # Windows bildirimleri tepsi simgesinden gösterilir
+
+    def _fill_tray_menu(self, menu):
+        menu.clear()
+        if self.sync and self.sync.update_available:
+            act_u = menu.addAction("⬆ Yeni Güncelleme Var — Şimdi Güncelle!", lambda: apply_app_update(self))
+            f = act_u.font()
+            f.setBold(True)
+            act_u.setFont(f)
+            menu.addSeparator()
+        menu.addAction("📊 Oyun Geçmişi…", self.open_history)
+        menu.addAction("📖 Kısayollar ve Kullanım Rehberi…", lambda: show_shortcuts_guide(self, self.accent_hex))
+        menu.addAction("🙈 Paneli Gizle" if self.isVisible() else "👁️ Paneli Göster", self.toggle_panel)
+        menu.addAction("🔄 GitHub ile Senkronize Et", lambda: self.sync and self.sync.request())
+        menu.addSeparator()
+        self._add_color_menu(menu)
+        self._add_overlay_menu(menu)
+        self._add_opacity_menu(menu)
+        menu.addSeparator()
+        menu.addAction("🚪 Kapat", QApplication.instance().quit)
+
+    def toggle_panel(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+
+    def _on_tick(self):
+        t = self.telemetry
+        if t.gpu.nv is not None:
+            t.gpu.nv.wanted = self.isVisible() or t.capturing()
+        t.update()
+        if t.capture is not None:
+            err = t.capture.take_error()
+            if err:
+                notify("Oyun İzleyici — kare yakalama sorunu", err[:240])
+        if self.sync is not None and self.sync.tick():
+            if self.history_win is not None and self.history_win.isVisible():
+                self.history_win.refresh()
+        if self.tray is not None:
+            tip = "Oyun İzleyici"
+            if t.game_name:
+                tip += f"\n{t.game_name}" + (f" — {t.fps} FPS" if t.fps is not None else " (duraklatıldı)")
+            if self.sync is not None:
+                tip += "\n" + self.sync.status_text()
+            self.tray.setToolTip(tip)
+        while t.finished_events:
+            self._on_session_finished(t.finished_events.pop(0))
+        if self.summary and (time.time() > self.summary_until or t.fps is not None):
+            self.summary = None
+        if self.store is not None:
+            try:
+                self.store.backup_if_needed()  # günde bir kez (dosya varsa hiçbir şey yapmaz)
+            except Exception:
+                pass
+        self.update()
+
+    def _on_session_finished(self, res):
+        total = None
+        try:
+            g = self.store.game_total(res["game"], self.store.machine_id) if self.store else None
+            total = g["secs"] if g else None
+        except Exception:
+            pass
+        self.summary = dict(res, total_secs=total)
+        self.summary_until = time.time() + 90
+        body = (f"Ort. {res['avg_fps']:.0f} FPS  ·  1% Low {res['low1']:.0f}  ·  0.1% Low {res['low01']:.0f}\n"
+                f"GPU {_num(res['gpu_temp_avg'])}/{_num(res['gpu_temp_max'])} °C, {_num(res['gpu_w_avg'])} W  ·  "
+                f"CPU {_num(res['cpu_temp_avg'])}/{_num(res['cpu_temp_max'])} °C")
+        if total:
+            body += f"\nBu oyunda toplam: {fmt_duration(total)}"
+        notify(f"{res['game']} — {fmt_duration(res['duration_s'])} oynandı", body)
+        if self.sync is not None:
+            self.sync.request()
+        if self.history_win is not None and self.history_win.isVisible():
+            self.history_win.refresh()
+
+    def closeEvent(self, event):
+        if self.tray is not None and self.mode == "tepsi":
+            self.hide()
+            event.ignore()
+            return
+        QApplication.instance().quit()
+        event.accept()
+
+    def shutdown(self):
+        self.save_settings()
+        self.telemetry.checkpoint_now()
+        self.telemetry.stop()
+
+    def open_history(self):
+        if self.store is None:
+            notify("Oyun İzleyici", "Kayıt veritabanı açılamadığı için geçmiş gösterilemiyor.")
+            return
+        if self.history_win is None:
+            self.history_win = HistoryWindow(self.store, self.sync)
+        self.history_win.refresh()
+        self.history_win.show()
+        self.history_win.raise_()
+        self.history_win.activateWindow()
+
+    def _logical(self, pos):
+        return QPointF(pos.x() * self.base_w / max(1, self.width()),
+                       pos.y() * self.base_h / max(1, self.height()))
+
+    def _on_anim(self):
+        rpm = self.telemetry.fan_rpm
+        if rpm <= 0 or not self.isVisible():
+            return
+        # Dönüş hızı RPM ile orantılı (görsel amaçlı)
+        self.telemetry.fan_angle = (self.telemetry.fan_angle + 10.0 + 30.0 * min(1.0, rpm / 3000.0)) % 360.0
+        sx = self.width() / float(self.base_w)
+        sy = self.height() / float(self.base_h)
+        # Fan ikonu mantıksal (296, 10, 88, 38) -> x: 296..384 alanında
+        self.update(QRect(int(290 * sx), int(4 * sy), int(98 * sx) + 2, int(52 * sy) + 2))
+
+    def mousePressEvent(self, event):
+        lpos = self._logical(event.position())
+        if event.button() == Qt.MouseButton.LeftButton and self.DOTS_RECT.contains(lpos):
+            self._show_context_menu(event.globalPosition().toPoint())
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and \
+                self.sync and self.sync.update_available and self.UPDATE_RECT.contains(lpos):
+            apply_app_update(self)
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._show_context_menu(event.globalPosition().toPoint())
+
+    def mouseMoveEvent(self, event):
+        lpos = self._logical(event.position())
+        hover = self.DOTS_RECT.contains(lpos)
+        uhover = bool(self.sync and self.sync.update_available and self.UPDATE_RECT.contains(lpos))
+        if hover != self.dots_hover or uhover != self.update_hover:
+            self.dots_hover = hover
+            self.update_hover = uhover
+            self.setCursor(Qt.CursorShape.PointingHandCursor if (hover or uhover) else Qt.CursorShape.ArrowCursor)
+            self.update()
+        if self.drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self.drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_pos is not None:
+            self.save_settings()
+        self.drag_pos = None
+
+    def wheelEvent(self, event):
+        # Ctrl + tekerlek: saydamlık; sadece tekerlek: boyut
+        delta = event.angleDelta().y()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if delta:
+                self.set_opacity(self.opacity + (0.05 if delta > 0 else -0.05))
+            return
+        if delta > 0:
+            self._set_scale(min(1.5, self.scale_factor + 0.05))
+        elif delta < 0:
+            self._set_scale(max(0.7, self.scale_factor - 0.05))
+
+    def leaveEvent(self, event):
+        if self.dots_hover or self.update_hover:
+            self.dots_hover = False
+            self.update_hover = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def _show_context_menu(self, global_pos):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{ background-color: #0c1410; color: #ffffff; border: 1px solid {self.accent_hex}; font-weight: bold; }}
+            QMenu::item {{ padding: 6px 20px; }}
+            QMenu::item:selected {{ background-color: #1b3b26; color: {self.accent_hex}; }}
+        """)
+        if self.sync and self.sync.update_available:
+            act_upd = QAction("⬆ Yeni Güncelleme Var — Şimdi Güncelle!", self)
+            act_upd.triggered.connect(lambda: apply_app_update(self))
+            menu.addAction(act_upd)
+            menu.addSeparator()
+        act_hist = QAction("📊 Oyun Geçmişi…", self)
+        act_hist.triggered.connect(self.open_history)
+        menu.addAction(act_hist)
+        act_guide = QAction("📖 Kısayollar ve Kullanım Rehberi…", self)
+        act_guide.triggered.connect(lambda: show_shortcuts_guide(self, self.accent_hex))
+        menu.addAction(act_guide)
+        act_sync = QAction("🔄 GitHub ile Senkronize Et / Güncelleme Denetle", self)
+        act_sync.triggered.connect(lambda: self.sync and self.sync.request())
+        menu.addAction(act_sync)
+        menu.addSeparator()
+        self._add_color_menu(menu)
+        menu.addSeparator()
+
+        act_top = QAction("📌 Her Zaman Üstte (Aktif)" if self.always_on_top else "📌 Her Zaman Üstte Tut", self)
+        act_top.triggered.connect(self._toggle_top)
+        menu.addAction(act_top)
+
+        act_hdmi = QAction("🖥️ Sol Monitöre (HDMI) Hizala", self)
+        act_hdmi.triggered.connect(self.move_to_left_hdmi_monitor)
+        menu.addAction(act_hdmi)
+
+        act_reset = QAction("📐 Boyutu Sıfırla (%100)", self)
+        act_reset.triggered.connect(lambda: self._set_scale(1.0))
+        menu.addAction(act_reset)
+        self._add_opacity_menu(menu)
+        menu.addSeparator()
+        self._add_overlay_menu(menu)
+
+        menu.addSeparator()
+        if self.tray is not None:
+            act_hide = QAction("🙈 Paneli Gizle (tepsi simgesinde kalır)", self)
+            act_hide.triggered.connect(self.hide)
+            menu.addAction(act_hide)
+        act_quit = QAction("🚪 Kapat", self)
+        act_quit.triggered.connect(QApplication.instance().quit)
+        menu.addAction(act_quit)
+        menu.exec(global_pos)
+
+    # --- Oyun içi gösterge (MangoHud) ve panel saydamlığı ---
+    def _radio_menu(self, parent, title, options, current, on_pick):
+        sub = parent.addMenu(title)
+        for value, label in options:
+            act = sub.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(value == current)
+            act.triggered.connect(lambda _=False, v=value: on_pick(v))
+        return sub
+
+    def _add_overlay_menu(self, menu):
+        if IS_WIN:
+            return                          # oyun içi gösterge MangoHud'a bağlı (Linux)
+        sub = menu.addMenu("🎮 Oyun İçi Gösterge (MangoHud)")
+        o = self.overlay
+        self._radio_menu(sub, "👁️ Görünüm", OVERLAY_MODES, o["mode"], lambda v: self.set_overlay(mode=v))
+        styled = o["mode"] in ("tek", "detay")
+        for title, opts, key in (("📍 Konum", OVERLAY_POSITIONS, "pos"), ("🌫️ Arka Plan Saydamlığı", OVERLAY_ALPHAS, "bg"),
+                                 ("🔤 Yazı Boyutu", OVERLAY_SIZES, "size")):
+            m = self._radio_menu(sub, title, opts, o[key], lambda v, k=key: self.set_overlay(**{k: v}))
+            m.setEnabled(styled)
+        sub.addSeparator()
+        info = sub.addAction("⌨️ Oyunda göster / gizle: Sağ Shift + F12")
+        info.setEnabled(False)
+        info2 = sub.addAction("⚡ Değişiklik açık oyunda anında uygulanır")
+        info2.setEnabled(False)
+
+    def _add_opacity_menu(self, menu):
+        opts = [
+            (1.0, "%100 (Tam Koyu Arka Plan)"),
+            (0.85, "%85"),
+            (0.7, "%70"),
+            (0.5, "%50"),
+            (0.3, "%30"),
+            (0.15, "%15 (Hafif Cam)"),
+            (0.0, "%0 (Tam Şeffaf — Sadece Yazı & Grafikler)"),
+        ]
+        cur = min(opts, key=lambda o: abs(o[0] - self.opacity))[0]
+        m = self._radio_menu(menu, "🪟 Arka Plan Saydamlığı (Ctrl + tekerlek)", opts, cur, self.set_opacity)
+        m.setEnabled(self.isVisible())
+
+    def set_opacity(self, value):
+        self.opacity = min(1.0, max(0.0, round(value, 2)))
+        self.setWindowOpacity(1.0)
+        self.update()
+        self.save_settings()
+
+    def set_overlay(self, **changes):
+        self.overlay.update(changes)
+        o = self.overlay
+        pci = mangohud_gpu_slot(self.telemetry.gpu)
+        try:
+            apply_overlay(o["mode"], o["pos"], o["bg"], o["size"], pci)
+        except Exception as e:
+            notify("Oyun İzleyici", f"MangoHud ayarı yazılamadı: {e}")
+            return
+        self.save_settings()
+        label = dict(OVERLAY_MODES).get(o["mode"], o["mode"])
+        notify("Oyun içi gösterge", f"{label} — açık oyunda hemen uygulanır (Sağ Shift + F12: göster/gizle)")
+
+    def _toggle_top(self):
+        self.always_on_top = not self.always_on_top
+        pos = self.pos()
+        self._apply_window_flags()
+        self.show()
+        self.move(pos)
+        self.save_settings()
+
+    # --- Custom Icon Painters ---
+    def _draw_ring_icon(self, p: QPainter, cx, cy, r, pct, green):
+        pen_bg = QPen(QColor(25, 55, 35), 3.5)
+        p.setPen(pen_bg)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+        pen_fg = QPen(green, 3.5)
+        pen_fg.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen_fg)
+        span = int(-360 * 16 * (max(5, min(100, pct)) / 100.0))
+        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), 90 * 16, span)
+
+    def _draw_bolt_icon(self, p: QPainter, cx, cy, size, green):
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(green)
+        poly = QPolygonF([
+            QPointF(cx + size * 0.15, cy - size * 0.9),
+            QPointF(cx - size * 0.55, cy + size * 0.1),
+            QPointF(cx - size * 0.05, cy + size * 0.1),
+            QPointF(cx - size * 0.25, cy + size * 0.9),
+            QPointF(cx + size * 0.55, cy - size * 0.15),
+            QPointF(cx + size * 0.05, cy - size * 0.15),
+        ])
+        p.drawPolygon(poly)
+
+    def _draw_thermometer_icon(self, p: QPainter, cx, cy, size, green):
+        p.setPen(QPen(green, 2.2))
+        p.setBrush(green)
+        bulb_r = size * 0.38
+        p.drawEllipse(QPointF(cx, cy + size * 0.42), bulb_r, bulb_r)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(cx - size * 0.2, cy - size * 0.85, size * 0.4, size * 1.15), 3, 3)
+        p.drawLine(QPointF(cx, cy + size * 0.3), QPointF(cx, cy - size * 0.35))
+
+    def _draw_gauge_icon(self, p: QPainter, cx, cy, r, green):
+        pen = QPen(green, 2.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(cx - r, cy - r * 0.7, 2 * r, 2 * r), 0 * 16, 180 * 16)
+        # Needle
+        p.drawLine(QPointF(cx, cy + r * 0.25), QPointF(cx + r * 0.55, cy - r * 0.35))
+        p.setBrush(green)
+        p.drawEllipse(QPointF(cx, cy + r * 0.25), 2.5, 2.5)
+
+    def _draw_settings_gear_icon(self, p: QPainter, cx: float, cy: float, r: float, color: QColor, hover: bool):
+        p.save()
+        if hover:
+            glow = QColor(color)
+            glow.setAlpha(60)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(glow)
+            p.drawEllipse(QPointF(cx, cy), r * 1.9, r * 1.9)
+        pen = QPen(QColor(255, 255, 255) if hover else color, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # 8 dişli çark (gear teeth)
+        r_body = r * 0.72
+        r_tooth = r * 1.05
+        for i in range(8):
+            ang = math.radians(i * 45.0)
+            x1 = cx + math.cos(ang) * (r_body * 0.85)
+            y1 = cy + math.sin(ang) * (r_body * 0.85)
+            x2 = cx + math.cos(ang) * r_tooth
+            y2 = cy + math.sin(ang) * r_tooth
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        p.setBrush(QColor(6, 9, 8))
+        p.drawEllipse(QPointF(cx, cy), r_body, r_body)
+        p.setBrush(QColor(255, 255, 255) if hover else color)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), r * 0.28, r * 0.28)
+        p.restore()
+
+    def _draw_gpu_3fan_icon(self, p: QPainter, x, y, w, h, green, angle):
+        p.save()
+        c_mid = QColor(green)
+        c_mid.setAlpha(135)
+        c_dark = QColor(green.red() // 6, green.green() // 6, green.blue() // 6)
+        c_deep = QColor(green.red() // 11, green.green() // 11, green.blue() // 11)
+        c_blade = QColor(green)
+        c_blade.setAlpha(65)
+
+        # 1. MSI Gaming X Trio / Suprim tarzı fanları takip eden agresif poligonal shroud konturu
+        fan_r = min(h * 0.38, (w - 10) / 6.05)
+        centers_x = [x + w * 0.185, x + w * 0.50, x + w * 0.815]
+        cy = y + h * 0.50
+
+        c0, c1, c2 = centers_x
+        v01 = (c0 + c1) * 0.5
+        v12 = (c1 + c2) * 0.5
+        top_peak = y + 1.2
+        top_valley = y + 5.0
+        bot_peak = y + h - 1.2
+        bot_valley = y + h - 5.0
+        chamfer = 6.5
+
+        shroud = QPainterPath()
+        shroud.moveTo(x + 1.0, cy - h * 0.22)
+        shroud.lineTo(x + chamfer, top_peak + 1.2)
+        # Sol fan üst kemeri
+        shroud.lineTo(c0 - fan_r * 0.55, top_peak)
+        shroud.lineTo(c0 + fan_r * 0.55, top_peak)
+        # 1-2 fan arası V-girintisi (Trio shroud boğumu)
+        shroud.lineTo(v01, top_valley)
+        # Orta fan üst kemeri
+        shroud.lineTo(c1 - fan_r * 0.55, top_peak)
+        shroud.lineTo(c1 + fan_r * 0.55, top_peak)
+        # 2-3 fan arası V-girintisi
+        shroud.lineTo(v12, top_valley)
+        # Sağ fan üst kemeri
+        shroud.lineTo(c2 - fan_r * 0.55, top_peak)
+        shroud.lineTo(c2 + fan_r * 0.55, top_peak)
+        shroud.lineTo(x + w - chamfer, top_peak + 1.2)
+        shroud.lineTo(x + w - 1.0, cy - h * 0.22)
+        shroud.lineTo(x + w - 1.0, cy + h * 0.22)
+        shroud.lineTo(x + w - chamfer, bot_peak - 1.2)
+        # Sağ fan alt kemeri
+        shroud.lineTo(c2 + fan_r * 0.55, bot_peak)
+        shroud.lineTo(c2 - fan_r * 0.55, bot_peak)
+        # 2-3 fan arası alt V-girintisi
+        shroud.lineTo(v12, bot_valley)
+        # Orta fan alt kemeri
+        shroud.lineTo(c1 + fan_r * 0.55, bot_peak)
+        shroud.lineTo(c1 - fan_r * 0.55, bot_peak)
+        # 1-2 fan arası alt V-girintisi
+        shroud.lineTo(v01, bot_valley)
+        # Sol fan alt kemeri
+        shroud.lineTo(c0 + fan_r * 0.55, bot_peak)
+        shroud.lineTo(c0 - fan_r * 0.55, bot_peak)
+        shroud.lineTo(x + chamfer, bot_peak - 1.2)
+        shroud.lineTo(x + 1.0, cy + h * 0.22)
+        shroud.closeSubpath()
+
+        p.setPen(QPen(green, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(c_dark)
+        p.drawPath(shroud)
+
+        # MSI Trio tarzı fanlar arası çapraz RGB pençe (claw) aksan çizgileri
+        p.setPen(QPen(green, 1.3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for vx in (v01, v12):
+            p.drawLine(QPointF(vx - 2.2, top_valley + 1.5), QPointF(vx + 1.2, top_valley + 5.2))
+            p.drawLine(QPointF(vx + 2.2, top_valley + 1.5), QPointF(vx - 1.2, top_valley + 5.2))
+            p.drawLine(QPointF(vx - 2.2, bot_valley - 1.5), QPointF(vx + 1.2, bot_valley - 5.2))
+            p.drawLine(QPointF(vx + 2.2, bot_valley - 1.5), QPointF(vx - 1.2, bot_valley - 5.2))
+
+        # 2. Sekizgen/Dairesel fan yuvaları ve 9 kanatlı Torx Fan 4.0 / 5.0 kavisli pervaneler
+        num_blades = 9
+        for idx, fcx in enumerate(centers_x):
+            p.setPen(QPen(c_mid, 1.0))
+            p.setBrush(c_deep)
+            p.drawEllipse(QPointF(fcx, cy), fan_r + 0.9, fan_r + 0.9)
+
+            p.setPen(QPen(green, 1.3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(fcx, cy), fan_r, fan_r)
+
+            dir_sign = -1.0 if idx == 1 else 1.0
+            base_ang = angle * dir_sign + idx * 15.0
+
+            p.setPen(QPen(green, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(c_blade)
+            hub_r = fan_r * 0.27
+            tip_r = fan_r * 0.89
+
+            for b in range(num_blades):
+                a0 = math.radians(base_ang + b * (360.0 / num_blades))
+                a_mid = a0 + dir_sign * 0.40
+                a_tip = a0 + dir_sign * 0.68
+                a_back = a0 + dir_sign * 0.20
+
+                sx = fcx + math.cos(a0) * hub_r
+                sy = cy + math.sin(a0) * hub_r
+                cx1 = fcx + math.cos(a_mid) * (fan_r * 0.63)
+                cy1 = cy + math.sin(a_mid) * (fan_r * 0.63)
+                tx = fcx + math.cos(a_tip) * tip_r
+                ty = cy + math.sin(a_tip) * tip_r
+                bx = fcx + math.cos(a_back) * (hub_r * 1.12)
+                by = cy + math.sin(a_back) * (hub_r * 1.12)
+
+                blade = QPainterPath(QPointF(sx, sy))
+                blade.quadTo(QPointF(cx1, cy1), QPointF(tx, ty))
+                blade.quadTo(QPointF(cx1 * 0.96 + fcx * 0.04, cy1 * 0.96 + cy * 0.04), QPointF(bx, by))
+                blade.closeSubpath()
+                p.drawPath(blade)
+
+            # Merkez motor göbeği (MSI Torx metalik göbek halkası)
+            p.setPen(QPen(green, 1.15))
+            p.setBrush(c_dark)
+            p.drawEllipse(QPointF(fcx, cy), hub_r, hub_r)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(green)
+            p.drawEllipse(QPointF(fcx, cy), hub_r * 0.38, hub_r * 0.38)
+
+        p.restore()
+
+    def paintEvent(self, event):
+        t = self.telemetry
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        # Scale logical coordinate system to 390 x 770
+        p.scale(self.width() / float(self.base_w), self.height() / float(self.base_h))
+
+        W, H = self.base_w, self.base_h
+        # Arka plan ve çerçeve çizgileri self.opacity ile şeffaflaşır; tüm yazılar, sayılar ve aktif grafikler %100 opak kalır
+        bg_alpha = int(round(255 * self.opacity))
+        line_alpha = int(round(255 * self.opacity))
+        track_alpha = int(round(55 + 200 * self.opacity))
+
+        bg_dark = QColor(6, 9, 8, bg_alpha)
+        bg_cell = QColor(8, 12, 10, bg_alpha)
+        green = QColor(self.accent_hex)
+        if not green.isValid():
+            green = QColor(64, 255, 112)
+        green_dim = QColor(max(12, green.red() // 4), max(16, green.green() // 4), max(14, green.blue() // 4), track_alpha)
+        grid_col = QColor(max(24, green.red() // 5 + 18), max(32, green.green() // 5 + 22), max(28, green.blue() // 5 + 20), line_alpha)
+        border_outer = QColor(max(35, green.red() // 3 + 20), max(45, green.green() // 3 + 25), max(38, green.blue() // 3 + 20), line_alpha)
+        white = QColor(248, 252, 249, 255)
+
+        # Önce pencere yüzeyini temizle (WA_TranslucentBackground açıkken eski kare izi kalmasın)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(0, 0, W, H, bg_dark)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+        if line_alpha > 0:
+            p.setPen(QPen(border_outer, 2))
+            p.drawRect(1, 1, W - 2, H - 2)
+
+        col_split = 216  # Left column width = 216, Right column = 174
+
+        # Izgara Y koordinatları
+        y_r1 = 0
+        y_r2 = 258
+        y_r3 = 382
+        y_r4 = 682
+
+        # Draw vertical middle divider (from top down to y_r4)
+        p.setPen(QPen(grid_col, 2.5))
+        p.drawLine(col_split, 0, col_split, y_r4)
+        p.drawLine(0, y_r2, W, y_r2)
+        p.drawLine(0, y_r3, W, y_r3)
+        p.drawLine(0, y_r4, W, y_r4)
+
+        # =====================================================================
+        # ROW 1 LEFT: Sol Üst Küçük Ayarlar Çarkı + RX 9070 XT + Giant FPS + LOW | AVG
+        # =====================================================================
+        dr = self.DOTS_RECT
+        self._draw_settings_gear_icon(p, dr.center().x() - 1.0, dr.center().y() - 1.0, 5.2, green, self.dots_hover)
+
+        f_gpu_title = self._font(22)
+        p.setFont(f_gpu_title)
+        p.setPen(white)
+        sm = self.summary
+        p.drawText(QRectF(16, 8, col_split - 22, 42), Qt.AlignmentFlag.AlignCenter,
+                   "SON OYUN" if sm else t.gpu_name)
+
+        # Neon green underline under RX 9070 XT
+        p.setPen(QPen(green, 3))
+        p.drawLine(8, 54, col_split - 8, 54)
+
+        # Giant FPS number (4 haneli 1000+ FPS değerlerinde 1. hanenin sola taşmasını önlemek için dinamik ölçek)
+        fps_text = f"{sm['avg_fps']:.0f}" if sm else ("—" if t.fps is None else str(t.fps))
+        f_fps_big = self._font(48 if len(fps_text) >= 4 else 62)
+        p.setFont(f_fps_big)
+        p.setPen(green)
+        p.drawText(QRectF(4, 58, col_split - 50, 105), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, fps_text)
+
+        f_fps_lbl = self._font(16)
+        p.setFont(f_fps_lbl)
+        p.drawText(QRectF(col_split - 46, 70, 44, 34), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, "ORT" if sm else "FPS")
+
+        # LOW | AVG at bottom of Row 1 Left
+        f_sub_num = self._font(18)
+        f_sub_lbl = self._font(13 if sm else 15)
+
+        # Vertical green bar between LOW and AVG
+        p.setPen(QPen(green, 3))
+        p.drawLine(col_split // 2, 174, col_split // 2, 242)
+
+        # LOW
+        p.setFont(f_sub_num)
+        p.setPen(white)
+        p.drawText(QRectF(10, 170, col_split // 2 - 14, 32), Qt.AlignmentFlag.AlignCenter, f"{sm['low1']:.0f}" if sm else ("—" if t.fps_low is None else str(t.fps_low)))
+        p.setFont(f_sub_lbl)
+        p.setPen(green)
+        p.drawText(QRectF(10, 206, col_split // 2 - 14, 32), Qt.AlignmentFlag.AlignCenter, "1% LOW")
+
+        # AVG
+        p.setFont(f_sub_num)
+        p.setPen(white)
+        p.drawText(QRectF(col_split // 2 + 4, 170, col_split // 2 - 14, 32), Qt.AlignmentFlag.AlignCenter, f"{sm['low01']:.0f}" if sm else ("—" if t.fps_avg is None else str(t.fps_avg)))
+        p.setFont(f_sub_lbl)
+        p.setPen(green)
+        p.drawText(QRectF(col_split // 2 + 4, 206, col_split // 2 - 14, 32), Qt.AlignmentFlag.AlignCenter, "0.1% LOW" if sm else "AVG")
+
+        # =====================================================================
+        # ROW 1 RIGHT: Fan % / RPM + 3-Fan Icon + GPU %, W, °C, MHz
+        # =====================================================================
+        rx = col_split + 8
+        rw = W - col_split - 16
+
+        f_fan_pct = self._font(14)
+        f_fan_rpm = self._font(10 if t.fan_rpm >= 1000 else 11)  # 3-4 haneli RPM fan simgesine asla taşmasın
+        p.setFont(f_fan_pct)
+        p.setPen(white)
+        p.drawText(QRectF(rx, 6, 74, 24), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{t.fan_pct}%")
+        p.setFont(f_fan_rpm)
+        p.drawText(QRectF(rx, 30, 74, 22), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{t.fan_rpm} RPM")
+
+        # 3-Fan MSI Trio tarzı GPU ikonu (sağa yaslı, RPM yazısıyla asla çakışmaz)
+        self._draw_gpu_3fan_icon(p, col_split + 80, 10, 88, 38, green, t.fan_angle)
+
+        # Divider under fan header
+        p.setPen(QPen(grid_col, 2))
+        p.drawLine(col_split, 56, W, 56)
+
+        # 4 GPU stat rows
+        f_stat = self._font(16)
+        p.setFont(f_stat)
+
+        # 1) GPU %
+        self._draw_ring_icon(p, rx + 14, 82, 11, t.gpu_load, green)
+        p.setPen(green)
+        p.drawText(QRectF(rx + 34, 66, 54, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "GPU")
+        p.setPen(white)
+        p.drawText(QRectF(rx + 84, 66, rw - 80, 32), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{t.gpu_load} %")
+
+        # 2) GPU Watt
+        self._draw_bolt_icon(p, rx + 14, 128, 13, green)
+        p.setPen(green)
+        p.drawText(QRectF(rx + 36, 112, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— W" if t.gpu_watt is None else f"{t.gpu_watt} W")
+
+        # 3) GPU Temp
+        self._draw_thermometer_icon(p, rx + 14, 176, 13, green)
+        p.setPen(white)
+        p.drawText(QRectF(rx + 36, 160, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— °C" if t.gpu_temp is None else f"{t.gpu_temp} °C")
+
+        # 4) GPU MHz
+        self._draw_gauge_icon(p, rx + 14, 226, 12, green)
+        p.setPen(green)
+        p.drawText(QRectF(rx + 36, 208, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{t.gpu_mhz} MHZ")
+
+        # =====================================================================
+        # ROW 2 LEFT: FRAMETIME Pill + Label
+        # =====================================================================
+        pill_cy = y_r2 + 44
+        p.setPen(QPen(green, 2.5))
+        p.drawLine(14, pill_cy, 68, pill_cy)
+        p.drawLine(col_split - 68, pill_cy, col_split - 14, pill_cy)
+
+        pill_rect = QRectF(68, pill_cy - 18, col_split - 136, 36)
+        p.setBrush(bg_cell)
+        p.drawRoundedRect(pill_rect, 16, 16)
+
+        f_ft_val = self._font(15)
+        p.setFont(f_ft_val)
+        p.setPen(white)
+        p.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, (f"{sm['avg_ft']:.1f} ms" if sm and sm.get("avg_ft") else
+                    "—" if t.frametime_ms is None else f"{t.frametime_ms:.1f} ms"))
+
+        f_ft_lbl = self._font(17 if sm else 20)
+        p.setFont(f_ft_lbl)
+        p.setPen(green)
+        p.drawText(QRectF(8, y_r2 + 72, col_split - 16, 40), Qt.AlignmentFlag.AlignCenter, "ORT FRAMETIME" if sm else "FRAMETIME")
+
+        # =====================================================================
+        # ROW 2 RIGHT: VRAM MB + Progress Bar + VRAM %
+        # =====================================================================
+        f_vram_mb = self._font(18)
+        p.setFont(f_vram_mb)
+        p.setPen(white)
+        p.drawText(QRectF(col_split + 8, y_r2 + 12, W - col_split - 16, 34), Qt.AlignmentFlag.AlignCenter, f"{t.vram_used_mb} MB")
+
+        # VRAM Progress bar
+        bar_x = col_split + 16
+        bar_w = W - col_split - 32
+        bar_y = y_r2 + 54
+        bar_h = 14
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(green_dim)
+        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 4, 4)
+        fill_w = max(6.0, bar_w * (min(100, t.vram_pct) / 100.0))
+        p.setBrush(green)
+        p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 4, 4)
+
+        f_vram_pct = self._font(19)
+        p.setFont(f_vram_pct)
+        p.setPen(green)
+        p.drawText(QRectF(col_split + 8, y_r2 + 74, W - col_split - 16, 38), Qt.AlignmentFlag.AlignCenter, f"VRAM {t.vram_pct} %")
+
+        # =====================================================================
+        # ROW 3 LEFT: R7 7800X3D + 8 Core Bars + RAM GB / Bar / RAM %
+        # =====================================================================
+        f_cpu_title = self._font(20)
+        p.setFont(f_cpu_title)
+        p.setPen(white)
+        p.drawText(QRectF(8, y_r3 + 10, col_split - 16, 36), Qt.AlignmentFlag.AlignCenter, t.cpu_name)
+
+        # Neon green line under CPU title
+        p.setPen(QPen(green, 3))
+        p.drawLine(8, y_r3 + 54, col_split - 8, y_r3 + 54)
+
+        # 8 Core vertical bars
+        bars_top = y_r3 + 68
+        bars_h = 64
+        num_bars = max(1, min(16, len(t.core_loads)))
+        avail_bw = col_split - 28
+        slot_w = avail_bw / num_bars
+        bar_thick = slot_w * 0.56
+
+        for i in range(num_bars):
+            bx = 14 + i * slot_w + (slot_w - bar_thick) / 2.0
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(green_dim)
+            p.drawRoundedRect(QRectF(bx, bars_top, bar_thick, bars_h), 2, 2)
+
+            c_ld = t.core_loads[i] if i < len(t.core_loads) else t.cpu_load
+            bh = max(6.0, bars_h * (max(5, min(100, c_ld)) / 100.0))
+            p.setBrush(green)
+            p.drawRoundedRect(QRectF(bx, bars_top + bars_h - bh, bar_thick, bh), 2, 2)
+
+        # Sub-divider between CPU core bars and RAM
+        y_ram_div = y_r3 + 148
+        p.setPen(QPen(grid_col, 2))
+        p.drawLine(0, y_ram_div, col_split, y_ram_div)
+
+        # RAM Used / Total GB
+        f_ram_gb = self._font(15)
+        p.setFont(f_ram_gb)
+        p.setPen(white)
+        p.drawText(
+            QRectF(8, y_ram_div + 10, col_split - 16, 28),
+            Qt.AlignmentFlag.AlignCenter,
+            f"{t.ram_used_gb:.1f} / {t.ram_total_gb:.1f} GB"
+        )
+
+        # RAM Progress Bar
+        rbar_x = 14
+        rbar_w = col_split - 28
+        rbar_y = y_ram_div + 44
+        rbar_h = 13
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(green_dim)
+        p.drawRoundedRect(QRectF(rbar_x, rbar_y, rbar_w, rbar_h), 4, 4)
+        rfill_w = max(6.0, rbar_w * (min(100, t.ram_pct) / 100.0))
+        p.setBrush(green)
+        p.drawRoundedRect(QRectF(rbar_x, rbar_y, rfill_w, rbar_h), 4, 4)
+
+        # RAM %
+        f_ram_pct = self._font(20)
+        p.setFont(f_ram_pct)
+        p.setPen(green)
+        p.drawText(QRectF(8, y_ram_div + 64, col_split - 16, 36), Qt.AlignmentFlag.AlignCenter, f"RAM {t.ram_pct} %")
+
+        # DDR5 6000 MT/s label (RAM yazısının hemen altında)
+        f_ddr = self._font(13)
+        p.setFont(f_ddr)
+        p.setPen(white)
+        p.drawText(QRectF(8, y_ram_div + 102, col_split - 16, 26), Qt.AlignmentFlag.AlignCenter, t.ram_speed_label)
+
+        # =====================================================================
+        # ROW 3 RIGHT: CPU %, W, °C, GHz  |  Divider  |  PSU Total Watt
+        # =====================================================================
+        p.setFont(f_stat)
+
+        # 1) CPU %
+        self._draw_ring_icon(p, rx + 14, y_r3 + 32, 11, t.cpu_load, green)
+        p.setPen(white)
+        p.drawText(QRectF(rx + 34, y_r3 + 16, 54, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "CPU")
+        p.drawText(QRectF(rx + 84, y_r3 + 16, rw - 80, 32), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{t.cpu_load} %")
+
+        # 2) CPU Watt
+        self._draw_bolt_icon(p, rx + 14, y_r3 + 84, 13, green)
+        p.setPen(green)
+        p.drawText(QRectF(rx + 36, y_r3 + 68, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— W" if t.cpu_watt is None else f"{t.cpu_watt} W")
+
+        # 3) CPU Temp
+        self._draw_thermometer_icon(p, rx + 14, y_r3 + 140, 13, green)
+        p.setPen(white)
+        p.drawText(QRectF(rx + 36, y_r3 + 124, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— °C" if t.cpu_temp is None else f"{t.cpu_temp} °C")
+
+        # 4) CPU GHz
+        self._draw_gauge_icon(p, rx + 14, y_r3 + 196, 12, green)
+        p.setPen(green)
+        p.drawText(QRectF(rx + 36, y_r3 + 178, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— GHZ" if t.cpu_ghz is None else f"{t.cpu_ghz:.2f} GHZ")
+
+        # Sub-divider between CPU stats and PSU section
+        y_psu_div = y_r3 + 232
+        p.setPen(QPen(grid_col, 2))
+        p.drawLine(col_split, y_psu_div, W, y_psu_div)
+
+        # 5) PSU Total Watt (ayrı bölme içinde ortalanmış)
+        self._draw_bolt_icon(p, rx + 14, y_psu_div + 34, 12, green)
+        p.setFont(self._font(15))
+        p.setPen(white)
+        p.drawText(QRectF(rx + 34, y_psu_div + 18, 54, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "PSU")
+        p.setPen(green)
+        p.drawText(QRectF(rx + 74, y_psu_div + 18, rw - 70, 32), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{t.psu_watt} W")
+
+        # =====================================================================
+        # ROW 4 (BOTTOM FOOTER): Active Game on Right Screen / Brand Signature
+        # =====================================================================
+        main_footer = sm["game"] if sm else (t.game_name if t.game_name else (t.cfg.get("baslik") or "OYUN İZLEYİCİ"))
+        # Uzun oyun isimlerinin (ör. DOOM THE DARK AGES) kesilmeden sığması için dinamik font boyutu
+        for fsz in (22, 20, 18, 16, 14):
+            f_brand = self._font(fsz)
+            p.setFont(f_brand)
+            if p.fontMetrics().horizontalAdvance(main_footer) <= W - 20:
+                break
+        p.setPen(white)
+        main_footer = p.fontMetrics().elidedText(main_footer, Qt.TextElideMode.ElideRight, W - 20)
+        p.drawText(QRectF(8, y_r4 + 8, W - 16, 40), Qt.AlignmentFlag.AlignCenter, main_footer)
+
+        f_sub_brand = self._font(12 if t.game_name else 11)
+        p.setFont(f_sub_brand)
+        if self.sync and self.sync.update_available:
+            ur = self.UPDATE_RECT
+            p.setPen(QPen(green, 1.5))
+            p.setBrush(QColor(24, 68, 38) if self.update_hover else QColor(14, 38, 22))
+            p.drawRoundedRect(ur, 6, 6)
+            p.setPen(white if self.update_hover else green)
+            p.drawText(ur, Qt.AlignmentFlag.AlignCenter, "⬆ GÜNCELLEME VAR — TIKLA VE GÜNCELLE")
+        else:
+            p.setPen(green)
+            if sm:
+                sub_footer = f"BİTTİ · {fmt_duration(sm['duration_s'], True)}"
+                if sm.get("total_secs"):
+                    sub_footer += f" · TOPLAM {fmt_duration(sm['total_secs'], True)}"
+            elif t.game_name:
+                sess_sec = max(0.0, time.time() - t.session.start_ts) if t.session else 0.0
+                if sess_sec <= 0 and t.session:
+                    sess_sec = t.session.duration()
+                timer_str = fmt_clock_timer(sess_sec)
+                if t.fps is None:
+                    sub_footer = f"OYUN DURAKLATILDI · {timer_str}"
+                else:
+                    sub_footer = f"OYUN SÜRESİ · {timer_str}"
+            else:
+                sub_footer = f"OTURUM SÜRESİ · {fmt_clock_timer(read_system_uptime())}"
+            p.drawText(QRectF(8, y_r4 + 48, W - 16, 28), Qt.AlignmentFlag.AlignCenter, sub_footer)
+
+        p.end()
+
+
+_NOTIFY_TRAY = None
+
+
+def notify(title, body):
+    import subprocess
+    if IS_WIN:
+        try:
+            if _NOTIFY_TRAY is not None:
+                from PySide6.QtWidgets import QSystemTrayIcon
+                _NOTIFY_TRAY.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 9000)
+        except Exception:
+            pass
+        return
+    try:
+        subprocess.Popen(["notify-send", "-a", "Oyun İzleyici", "-i", "applications-games", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def acquire_single_instance(wait=0.0):
+    """Panel zaten açıksa None döner (ikinci kopya açılmaz). wait: kilit boşalana kadar beklenecek sn
+    (kendini güncelleyip yeniden başlayan Windows sürümü için)."""
+    if IS_WIN:
+        lock_path = os.path.join(DATA_DIR, "oyun-izleyici.lock")
+        os.makedirs(DATA_DIR, exist_ok=True)
+    else:
+        lock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "oyun-izleyici.lock")
+    deadline = time.time() + wait
+    while True:
+        fd = open(lock_path, "w")
+        try:
+            if IS_WIN:
+                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            fd.close()
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.3)
+
+
+def run_diagnostics():
+    """--tani: sensörleri ve (Windows'ta) PresentMon yakalamasını 8 sn deneyip sonucu yazdırır."""
+    import platform
+    print("Oyun İzleyici tanılama")
+    print("  Python:", sys.version.split()[0], "|", platform.platform())
+    try:
+        import PySide6
+        print("  PySide6:", PySide6.__version__)
+    except ImportError:
+        print("  PySide6: YOK")
+    print("  psutil:", "var" if _win_psutil() else "YOK (Windows'ta gerekli: pip install psutil)")
+    t = HardwareTelemetry(None)
+    time.sleep(1.0)
+    for _ in range(3):
+        t.update()
+        time.sleep(1.0)
+    print(f"  GPU : {t.gpu_name} ({t.gpu.kind}) yük %{t.gpu_load}  {t.gpu_watt} W  {t.gpu_temp} °C  "
+          f"{t.gpu_mhz} MHz  VRAM {t.vram_used_mb}/{t.vram_total_mb} MB")
+    print(f"  CPU : {t.cpu_name}  yük %{t.cpu_load}  {t.cpu_watt} W  {t.cpu_temp} °C  {t.cpu_ghz} GHz  "
+          f"çekirdek çubuğu: {len(t.core_loads)}")
+    print(f"  RAM : {t.ram_used_gb:.1f}/{t.ram_total_gb:.1f} GB   prizde: {t.on_ac}")
+    if IS_WIN:
+        import tempfile
+        print("  PresentMon:", PRESENTMON_EXE, "->", "var" if os.path.isfile(PRESENTMON_EXE) else "YOK")
+        out = tempfile.mkdtemp(prefix="oi-tani-")
+        cap = WinFrameCapture(out, PRESENTMON_EXE, t, (t.cfg.get("engelle") or "").split(","))
+        cap.BG_START_SEC = 2.0
+        if cap.start():
+            print("  8 sn kare yakalama deneniyor (bir oyun/video açıkken daha anlamlı)…")
+            time.sleep(8.0)
+            print("   durum:", cap.status, "| yakalanan kare:", cap.frames_seen, "| yazılan satır:", cap.rows_written)
+            print("   başlık:", (cap.header or "(henüz yok)")[:200])
+            with cap.lock:
+                print("   görülen süreçler:", sorted({cap._names.get(p, "?") for p in cap._frames})[:12])
+                print("   etkin oyun:", cap._active["name"] if cap._active else "(yok)")
+            if cap.error:
+                print("   HATA:", cap.error)
+            cap.stop()
+        else:
+            print("   HATA:", cap.error)
+    t.stop()
+
+
+def main():
+    if "--tani" in sys.argv:
+        run_diagnostics()
+        return
+    snapshot = "--snapshot" in sys.argv
+    lock = None
+    if not snapshot:
+        lock = acquire_single_instance(15.0 if os.environ.get("OI_RESTART") else 0.0)
+        if lock is None:
+            print("Oyun İzleyici Panel zaten açık.", file=sys.stderr)
+            sys.exit(0)
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # geçmiş penceresini kapatmak paneli kapatmasın
+    store, store_error = None, None
+    cfg = load_machine_config()
+    if not snapshot:
+        try:
+            os.makedirs(MANGOHUD_DIR, exist_ok=True)
+            store = SessionStore(cfg["kimlik"])
+        except Exception as e:
+            store_error = e
+    mode = cfg.get("mod", "otomatik")
+    if mode not in ("panel", "tepsi"):
+        mode = "panel" if len(QGuiApplication.screens()) >= 2 else "tepsi"
+    if snapshot:
+        mode = "panel"
+    win = HudWindow(store, store_error, mode)
+    if mode == "panel" or win.tray is None:
+        win.show()
+    if not snapshot:
+        app.aboutToQuit.connect(win.shutdown)
+
+    if snapshot:
+        idx = sys.argv.index("--snapshot")
+        out_path = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "/tmp/hud_snapshot.png"
+        QTimer.singleShot(600, lambda: (win.grab().save(out_path), app.quit()))
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
