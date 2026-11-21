@@ -40,7 +40,8 @@ if not IS_WIN and "QT_QPA_PLATFORM" not in os.environ:
 
 from PySide6.QtCore import Qt, QTimer, QRectF, QPointF, QRect, QPoint, QSettings
 from PySide6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPainterPath, QPolygonF, QAction, QGuiApplication
+    QPainter, QColor, QPen, QBrush, QFont, QPainterPath, QPolygonF, QAction, QGuiApplication,
+    QLinearGradient, QRadialGradient
 )
 from PySide6.QtWidgets import QApplication, QWidget, QMenu
 
@@ -2754,6 +2755,83 @@ class HistoryWindow(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR))
 
 
+# =============================================================================
+# EDNA TEMASI (KDE "Edna" renk şemasından): arduvaz mavisi gri zemin, camgöbeği vurgu,
+# gün batımı (kehribar / turuncu / mor) ikincil renkler. Alt bilgide dağ + kumul silüeti.
+# =============================================================================
+HEADER_H = 46   # üstteki saat / tarih şeridinin mantıksal yüksekliği (kapalıysa 0)
+TR_DAYS = ["PAZARTESİ", "SALI", "ÇARŞAMBA", "PERŞEMBE", "CUMA", "CUMARTESİ", "PAZAR"]
+TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül",
+             "Ekim", "Kasım", "Aralık"]
+EDNA_ACCENT = "#10a6d4"
+
+
+def tier_color(pct, base, edna):
+    """Edna temasında doluluk arttıkça vurgu rengi kehribara, sonra turuncuya döner."""
+    if not edna:
+        return base
+    if pct >= 90:
+        return QColor(246, 116, 0)
+    if pct >= 75:
+        return QColor(253, 188, 75)
+    return base
+
+
+def temp_color(celsius, base, edna):
+    if not edna or celsius is None:
+        return base
+    if celsius >= 85:
+        return QColor(231, 76, 60)
+    if celsius >= 75:
+        return QColor(253, 188, 75)
+    return base
+
+
+def draw_edna_landscape(p, W, y0, h):
+    """Alt bilgi çubuğunun arkasında: gün batımı ışıltısı, uzak dağ sırası, kumul ve tek ağaç."""
+    b = y0 + h
+    glow = QRadialGradient(W * 0.64, b + 8, W * 0.62)
+    glow.setColorAt(0.0, QColor(246, 150, 40, 80))
+    glow.setColorAt(0.45, QColor(200, 70, 110, 34))
+    glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(glow))
+    p.drawRect(QRectF(2, y0 + 2, W - 4, h - 4))
+
+    far = QPainterPath()
+    far.moveTo(2, b - 30)
+    far.cubicTo(40, b - 50, 72, b - 46, 112, b - 35)
+    far.cubicTo(152, b - 24, 192, b - 54, 248, b - 47)
+    far.cubicTo(292, b - 42, 332, b - 30, W - 2, b - 38)
+    far.lineTo(W - 2, b - 2)
+    far.lineTo(2, b - 2)
+    far.closeSubpath()
+    p.setBrush(QColor(84, 110, 122, 72))
+    p.drawPath(far)
+
+    dune = QPainterPath()
+    dune.moveTo(2, b - 15)
+    dune.cubicTo(80, b - 27, 160, b - 6, 240, b - 16)
+    dune.cubicTo(300, b - 23, 350, b - 10, W - 2, b - 19)
+    dune.lineTo(W - 2, b - 2)
+    dune.lineTo(2, b - 2)
+    dune.closeSubpath()
+    g = QLinearGradient(0, b - 28, 0, b)
+    g.setColorAt(0.0, QColor(245, 166, 35, 120))
+    g.setColorAt(0.55, QColor(214, 96, 70, 105))
+    g.setColorAt(1.0, QColor(110, 62, 120, 120))
+    p.setBrush(QBrush(g))
+    p.drawPath(dune)
+
+    tx, ty = W - 64, b - 16        # tepenin üstündeki tek ağaç
+    p.setBrush(QColor(78, 58, 42, 230))
+    p.drawRect(QRectF(tx - 0.9, ty - 7, 1.8, 7))
+    p.setBrush(QColor(112, 150, 62, 235))
+    p.drawEllipse(QPointF(tx, ty - 11), 5.2, 4.6)
+    p.drawEllipse(QPointF(tx - 3, ty - 8.5), 3.3, 3.0)
+    p.drawEllipse(QPointF(tx + 3, ty - 8.8), 3.3, 3.0)
+
+
 def show_shortcuts_guide(parent=None, accent_hex="#40ff70"):
     from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
     dlg = QDialog(parent)
@@ -2842,7 +2920,12 @@ class HudWindow(QWidget):
         self.always_on_top = self.settings.value("always_on_top", True, type=bool)
         self.scale_factor = min(1.5, max(0.7, self.settings.value("scale", 1.0, type=float)))
         self.base_w = 390
-        self.base_h = 770
+        self.show_clock = self.settings.value("show_clock", True, type=bool)
+        self.theme = self.settings.value("theme", "klasik", type=str)
+        if self.theme not in ("klasik", "edna"):
+            self.theme = "klasik"
+        self.header_h = HEADER_H if self.show_clock else 0
+        self.base_h = 770 + self.header_h
         self.drag_pos = None
         self.opacity = min(1.0, max(0.0, self.settings.value("opacity", 1.0, type=float)))
         self.accent_hex = self.settings.value("accent_color", "#40ff70", type=str) or "#40ff70"
@@ -2891,13 +2974,31 @@ class HudWindow(QWidget):
         self.settings.setValue("always_on_top", self.always_on_top)
         self.settings.setValue("opacity", self.opacity)
         self.settings.setValue("accent_color", self.accent_hex)
+        self.settings.setValue("theme", self.theme)
+        self.settings.setValue("show_clock", self.show_clock)
         for k, v in self.overlay.items():
             self.settings.setValue(f"overlay_{k}", v)
         self.settings.sync()
 
+    def set_theme(self, name):
+        self.theme = name if name in ("klasik", "edna") else "klasik"
+        if self.theme == "edna":
+            self.accent_hex = EDNA_ACCENT
+        self.save_settings()
+        self.update()
+
+    def set_show_clock(self, on):
+        self.show_clock = bool(on)
+        self.header_h = HEADER_H if self.show_clock else 0
+        self.base_h = 770 + self.header_h
+        self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
+        self.save_settings()
+        self.update()
+
     def set_accent_color(self, hex_code):
         c = QColor(hex_code)
         if c.isValid():
+            self.theme = "klasik"
             self.accent_hex = c.name()
             self.save_settings()
             self.update()
@@ -2919,11 +3020,19 @@ class HudWindow(QWidget):
             ("#ff6b00", "🟠 Turuncu (MSI / Ryzen)"),
             ("#ffffff", "⚪ Saf Beyaz (Monokrom)"),
         ]
+        act_edna = menu.addAction("🏞️ Edna Teması (KDE ile uyumlu)")
+        act_edna.setCheckable(True)
+        act_edna.setChecked(self.theme == "edna")
+        act_edna.triggered.connect(lambda _=False: self.set_theme("klasik" if self.theme == "edna" else "edna"))
+        act_clock = menu.addAction("🕒 Saat ve Tarih Şeridi")
+        act_clock.setCheckable(True)
+        act_clock.setChecked(self.show_clock)
+        act_clock.triggered.connect(lambda checked=False: self.set_show_clock(checked))
         sub = menu.addMenu("🎨 Tema Rengi / Renk Çarkı…")
         for hx, label in presets:
             act = sub.addAction(label)
             act.setCheckable(True)
-            act.setChecked(self.accent_hex.lower() == hx.lower())
+            act.setChecked(self.theme == "klasik" and self.accent_hex.lower() == hx.lower())
             act.triggered.connect(lambda _=False, v=hx: self.set_accent_color(v))
         sub.addSeparator()
         act_wheel = sub.addAction("🌈 Özel Renk Çarkı Aç…")
@@ -3091,7 +3200,7 @@ class HudWindow(QWidget):
 
     def _logical(self, pos):
         return QPointF(pos.x() * self.base_w / max(1, self.width()),
-                       pos.y() * self.base_h / max(1, self.height()))
+                       pos.y() * self.base_h / max(1, self.height()) - self.header_h)
 
     def _on_anim(self):
         rpm = self.telemetry.fan_rpm
@@ -3102,7 +3211,7 @@ class HudWindow(QWidget):
         sx = self.width() / float(self.base_w)
         sy = self.height() / float(self.base_h)
         # Fan ikonu mantıksal (296, 10, 88, 38) -> x: 296..384 alanında
-        self.update(QRect(int(290 * sx), int(4 * sy), int(98 * sx) + 2, int(52 * sy) + 2))
+        self.update(QRect(int(290 * sx), int((4 + self.header_h) * sy), int(98 * sx) + 2, int(52 * sy) + 2))
 
     def mousePressEvent(self, event):
         lpos = self._logical(event.position())
@@ -3267,6 +3376,76 @@ class HudWindow(QWidget):
         self.save_settings()
         label = dict(OVERLAY_MODES).get(o["mode"], o["mode"])
         notify("Oyun içi gösterge", f"{label} — açık oyunda hemen uygulanır (Sağ Shift + F12: göster/gizle)")
+
+    def _draw_header(self, p, W, hh, edna, accent, text, dim):
+        """Üstteki saat / tarih şeridi: gündüz-gece simgesi, büyük saat, saniye, gün adı ve tarih."""
+        import datetime
+        now = datetime.datetime.now()
+        base = QLinearGradient(0, 0, 0, hh)
+        if edna:
+            base.setColorAt(0.0, QColor(52, 68, 76, 255))
+            base.setColorAt(1.0, QColor(40, 53, 60, 255))
+        else:
+            base.setColorAt(0.0, QColor(255, 255, 255, 14))
+            base.setColorAt(1.0, QColor(0, 0, 0, 40))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(base))
+        p.drawRect(QRectF(2, 2, W - 4, hh - 3))
+
+        # gündüz: güneş, gece: hilal
+        cx, cy = 26.0, hh / 2.0
+        if 6 <= now.hour < 18:
+            sun = QColor(253, 188, 75)
+            p.setPen(QPen(sun, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for k in range(8):
+                a = math.radians(k * 45)
+                p.drawLine(QPointF(cx + math.cos(a) * 10.0, cy + math.sin(a) * 10.0),
+                           QPointF(cx + math.cos(a) * 13.0, cy + math.sin(a) * 13.0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(sun)
+            p.drawEllipse(QPointF(cx, cy), 6.6, 6.6)
+        else:
+            moon = QPainterPath()
+            moon.addEllipse(QPointF(cx, cy), 9.0, 9.0)
+            cut = QPainterPath()
+            cut.addEllipse(QPointF(cx + 5.0, cy - 3.0), 8.0, 8.0)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(201, 212, 230) if edna else accent)
+            p.drawPath(moon.subtracted(cut))
+
+        # saat:dakika (büyük) + saniye (küçük, soluk)
+        f_time = self._font(24)
+        p.setFont(f_time)
+        hm = now.strftime("%H:%M")
+        p.setPen(text)
+        p.drawText(QRectF(48, 0, 120, hh), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, hm)
+        adv = p.fontMetrics().horizontalAdvance(hm)
+        p.setFont(self._font(12))
+        p.setPen(accent)
+        p.drawText(QRectF(48 + adv + 3, 2, 40, hh - 8), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+                   now.strftime(":%S"))
+
+        # gün adı (vurgu rengi) + tarih
+        p.setFont(self._font(11))
+        p.setPen(accent)
+        p.drawText(QRectF(W - 190, 5, 178, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   TR_DAYS[now.weekday()])
+        p.setFont(self._font(13))
+        p.setPen(text if edna else dim)
+        p.drawText(QRectF(W - 190, 22, 178, 20), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                   f"{now.day} {TR_MONTHS[now.month - 1]} {now.year}")
+
+        # alt çizgi: Edna'da soğuktan sıcağa (camgöbeği -> kehribar -> mor) gradyan
+        line = QLinearGradient(0, 0, W, 0)
+        if edna:
+            line.setColorAt(0.0, QColor(16, 166, 212))
+            line.setColorAt(0.55, QColor(253, 188, 75))
+            line.setColorAt(1.0, QColor(190, 80, 140))
+        else:
+            line.setColorAt(0.0, accent)
+            line.setColorAt(1.0, accent)
+        p.setPen(QPen(QBrush(line), 2.0))
+        p.drawLine(QPointF(2, hh - 1.5), QPointF(W - 2, hh - 1.5))
 
     def _toggle_top(self):
         self.always_on_top = not self.always_on_top
@@ -3482,6 +3661,8 @@ class HudWindow(QWidget):
         p.scale(self.width() / float(self.base_w), self.height() / float(self.base_h))
 
         W, H = self.base_w, self.base_h
+        hh = self.header_h
+        edna = self.theme == "edna"
         # Arka plan ve çerçeve çizgileri self.opacity ile şeffaflaşır; tüm yazılar, sayılar ve aktif grafikler %100 opak kalır
         bg_alpha = int(round(255 * self.opacity))
         line_alpha = int(round(255 * self.opacity))
@@ -3496,15 +3677,33 @@ class HudWindow(QWidget):
         grid_col = QColor(max(24, green.red() // 5 + 18), max(32, green.green() // 5 + 22), max(28, green.blue() // 5 + 20), line_alpha)
         border_outer = QColor(max(35, green.red() // 3 + 20), max(45, green.green() // 3 + 25), max(38, green.blue() // 3 + 20), line_alpha)
         white = QColor(248, 252, 249, 255)
+        if edna:   # KDE "Edna" renk şeması
+            bg_dark = QColor(38, 50, 56, bg_alpha)
+            bg_cell = QColor(44, 58, 65, bg_alpha)
+            green = QColor(16, 166, 212)
+            green_dim = QColor(33, 52, 61, track_alpha)
+            grid_col = QColor(62, 80, 89, line_alpha)
+            border_outer = QColor(84, 110, 122, line_alpha)
+            white = QColor(237, 240, 242, 255)
 
         # Önce pencere yüzeyini temizle (WA_TranslucentBackground açıkken eski kare izi kalmasın)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-        p.fillRect(0, 0, W, H, bg_dark)
+        if edna:
+            zemin = QLinearGradient(0, 0, 0, H)
+            zemin.setColorAt(0.0, QColor(42, 55, 62, bg_alpha))
+            zemin.setColorAt(1.0, QColor(31, 42, 48, bg_alpha))
+            p.fillRect(QRectF(0, 0, W, H), QBrush(zemin))
+        else:
+            p.fillRect(0, 0, W, H, bg_dark)
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
         if line_alpha > 0:
             p.setPen(QPen(border_outer, 2))
             p.drawRect(1, 1, W - 2, H - 2)
+
+        if hh:
+            self._draw_header(p, W, hh, edna, green, white, QColor(190, 200, 195))
+            p.translate(0, hh)       # asıl panel içeriği şeridin altından başlar
 
         col_split = 216  # Left column width = 216, Right column = 174
 
@@ -3612,7 +3811,7 @@ class HudWindow(QWidget):
 
         # 3) GPU Temp
         self._draw_thermometer_icon(p, rx + 14, 176, 13, green)
-        p.setPen(white)
+        p.setPen(temp_color(t.gpu_temp, white, edna))
         p.drawText(QRectF(rx + 36, 160, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— °C" if t.gpu_temp is None else f"{t.gpu_temp} °C")
 
         # 4) GPU MHz
@@ -3660,7 +3859,7 @@ class HudWindow(QWidget):
         p.setBrush(green_dim)
         p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 4, 4)
         fill_w = max(6.0, bar_w * (min(100, t.vram_pct) / 100.0))
-        p.setBrush(green)
+        p.setBrush(tier_color(t.vram_pct, green, edna))
         p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 4, 4)
 
         f_vram_pct = self._font(19)
@@ -3696,7 +3895,7 @@ class HudWindow(QWidget):
 
             c_ld = t.core_loads[i] if i < len(t.core_loads) else t.cpu_load
             bh = max(6.0, bars_h * (max(5, min(100, c_ld)) / 100.0))
-            p.setBrush(green)
+            p.setBrush(tier_color(c_ld, green, edna))
             p.drawRoundedRect(QRectF(bx, bars_top + bars_h - bh, bar_thick, bh), 2, 2)
 
         # Sub-divider between CPU core bars and RAM
@@ -3723,7 +3922,7 @@ class HudWindow(QWidget):
         p.setBrush(green_dim)
         p.drawRoundedRect(QRectF(rbar_x, rbar_y, rbar_w, rbar_h), 4, 4)
         rfill_w = max(6.0, rbar_w * (min(100, t.ram_pct) / 100.0))
-        p.setBrush(green)
+        p.setBrush(tier_color(t.ram_pct, green, edna))
         p.drawRoundedRect(QRectF(rbar_x, rbar_y, rfill_w, rbar_h), 4, 4)
 
         # RAM %
@@ -3756,7 +3955,7 @@ class HudWindow(QWidget):
 
         # 3) CPU Temp
         self._draw_thermometer_icon(p, rx + 14, y_r3 + 140, 13, green)
-        p.setPen(white)
+        p.setPen(temp_color(t.cpu_temp, white, edna))
         p.drawText(QRectF(rx + 36, y_r3 + 124, rw - 36, 32), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "— °C" if t.cpu_temp is None else f"{t.cpu_temp} °C")
 
         # 4) CPU GHz
@@ -3780,6 +3979,8 @@ class HudWindow(QWidget):
         # =====================================================================
         # ROW 4 (BOTTOM FOOTER): Active Game on Right Screen / Brand Signature
         # =====================================================================
+        if edna:
+            draw_edna_landscape(p, W, y_r4, H - hh - y_r4)
         main_footer = sm["game"] if sm else (t.game_name if t.game_name else (t.cfg.get("baslik") or "OYUN İZLEYİCİ"))
         # Uzun oyun isimlerinin (ör. DOOM THE DARK AGES) kesilmeden sığması için dinamik font boyutu
         for fsz in (22, 20, 18, 16, 14):

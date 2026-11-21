@@ -8,7 +8,7 @@ Oyun oynarken canlı **FPS, 1% / 0.1% low, frametime, GPU / CPU / RAM** değerle
 > **Durum:** Linux sürümü günlük kullanımda. Windows sürümü yeni: mantığı sahte PresentMon ile uçtan uca test edildi ama gerçek Windows'ta henüz az denendi. Sorun olursa `tani.bat` çıktısıyla issue aç.
 
 ## Özellikler
-- Dikey HUD paneli (taşınır, boyutlanır, saydamlaşır, tema rengi); tek ekranda sadece tepsi simgesi.
+- Dikey HUD paneli (taşınır, boyutlanır, saydamlaşır, tema rengi ya da KDE "Edna" temasıyla uyumlu hazır tema); üstte saat ve tarih şeridi; tek ekranda sadece tepsi simgesi.
 - Oyun algılama ve **oturum kaydı** (SQLite, günlük yedekler, bozulmaya karşı onarım).
 - Oyun Geçmişi penceresi: oyun başına toplam, tek tek oturumlar, not ekleme, CSV dışa aktarma.
 - **Gerçek takılmaları gösteren** low değerleri: menü / yükleme ekranı patlamaları ayıklanır, kısa takılmalar korunur.
