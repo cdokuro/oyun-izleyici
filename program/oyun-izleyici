@@ -2882,6 +2882,26 @@ def show_shortcuts_guide(parent=None, accent_hex="#40ff70"):
     lay.addWidget(btn)
     dlg.exec()
 
+class StayOpenMenu(QMenu):
+    """İşaretlenebilir (checkable) öğelere tıklayınca menü kapanmasın: çoklu ayar tek seferde yapılabilsin.
+    Öğe tetiklenir, ardından pencere işaretleri ve pasif/aktif durumları günceller."""
+
+    def __init__(self, *args, owner=None, **kw):
+        super().__init__(*args, **kw)
+        self.owner = owner
+
+    def mouseReleaseEvent(self, e):
+        act = self.actionAt(e.position().toPoint())
+        if (act is not None and act.isEnabled() and act.isCheckable() and act.menu() is None
+                and e.button() == Qt.MouseButton.LeftButton):
+            act.trigger()
+            if self.owner is not None:
+                self.owner._refresh_menu_state()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+
 class HudWindow(QWidget):
     DOTS_RECT = QRectF(4, 4, 24, 24)        # sol üstteki küçük ayarlar çarkı menü butonu
     UPDATE_RECT = QRectF(8, 738, 374, 26)  # güncelleme varsa alt bilgi satırı tıklanabilir alan
@@ -3028,12 +3048,21 @@ class HudWindow(QWidget):
         act_clock.setCheckable(True)
         act_clock.setChecked(self.show_clock)
         act_clock.triggered.connect(lambda checked=False: self.set_show_clock(checked))
-        sub = menu.addMenu("🎨 Tema Rengi / Renk Çarkı…")
+        sub = self._submenu(menu, "🎨 Tema Rengi / Renk Çarkı…")
+        preset_acts = []
         for hx, label in presets:
             act = sub.addAction(label)
             act.setCheckable(True)
             act.setChecked(self.theme == "klasik" and self.accent_hex.lower() == hx.lower())
             act.triggered.connect(lambda _=False, v=hx: self.set_accent_color(v))
+            preset_acts.append((hx, act))
+
+        def sync_colors():
+            act_edna.setChecked(self.theme == "edna")
+            act_clock.setChecked(self.show_clock)
+            for hx, a in preset_acts:
+                a.setChecked(self.theme == "klasik" and self.accent_hex.lower() == hx.lower())
+        self._menu_sync.append(sync_colors)
         sub.addSeparator()
         act_wheel = sub.addAction("🌈 Özel Renk Çarkı Aç…")
         act_wheel.triggered.connect(self.pick_accent_color)
@@ -3087,7 +3116,7 @@ class HudWindow(QWidget):
             icon = QIcon(pm)
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip("Oyun İzleyici")
-        menu = QMenu()
+        menu = StayOpenMenu(owner=self)
         menu.aboutToShow.connect(lambda: self._fill_tray_menu(menu))  # işaretler her açılışta güncel
         self._fill_tray_menu(menu)
         self._tray_menu = menu
@@ -3100,6 +3129,7 @@ class HudWindow(QWidget):
 
     def _fill_tray_menu(self, menu):
         menu.clear()
+        self._menu_sync = []
         if self.sync and self.sync.update_available:
             act_u = menu.addAction("⬆ Yeni Güncelleme Var — Şimdi Güncelle!", lambda: apply_app_update(self))
             f = act_u.font()
@@ -3268,7 +3298,11 @@ class HudWindow(QWidget):
             self.update()
 
     def _show_context_menu(self, global_pos):
-        menu = QMenu(self)
+        self._build_context_menu().exec(global_pos)
+
+    def _build_context_menu(self):
+        self._menu_sync = []
+        menu = StayOpenMenu(self, owner=self)
         menu.setStyleSheet(f"""
             QMenu {{ background-color: #0c1410; color: #ffffff; border: 1px solid {self.accent_hex}; font-weight: bold; }}
             QMenu::item {{ padding: 6px 20px; }}
@@ -3315,29 +3349,50 @@ class HudWindow(QWidget):
         act_quit = QAction("🚪 Kapat", self)
         act_quit.triggered.connect(QApplication.instance().quit)
         menu.addAction(act_quit)
-        menu.exec(global_pos)
+        return menu
 
     # --- Oyun içi gösterge (MangoHud) ve panel saydamlığı ---
+    def _submenu(self, parent, title):
+        sub = StayOpenMenu(title, parent, owner=self)
+        parent.addMenu(sub)
+        return sub
+
+    def _refresh_menu_state(self):
+        """Menü açıkken yapılan seçimden sonra işaretleri / pasif-aktif durumlarını güncelle."""
+        for fn in list(getattr(self, "_menu_sync", [])):
+            try:
+                fn()
+            except RuntimeError:
+                pass                      # kapanmış menünün öğeleri
+
     def _radio_menu(self, parent, title, options, current, on_pick):
-        sub = parent.addMenu(title)
+        from PySide6.QtGui import QActionGroup
+        sub = self._submenu(parent, title)
+        grp = QActionGroup(sub)
+        grp.setExclusive(True)
         for value, label in options:
             act = sub.addAction(label)
             act.setCheckable(True)
             act.setChecked(value == current)
+            grp.addAction(act)
             act.triggered.connect(lambda _=False, v=value: on_pick(v))
         return sub
 
     def _add_overlay_menu(self, menu):
         if IS_WIN:
             return                          # oyun içi gösterge MangoHud'a bağlı (Linux)
-        sub = menu.addMenu("🎮 Oyun İçi Gösterge (MangoHud)")
+        sub = self._submenu(menu, "🎮 Oyun İçi Gösterge (MangoHud)")
         o = self.overlay
+        styled_menus = []
         self._radio_menu(sub, "👁️ Görünüm", OVERLAY_MODES, o["mode"], lambda v: self.set_overlay(mode=v))
         styled = o["mode"] in ("tek", "detay")
         for title, opts, key in (("📍 Konum", OVERLAY_POSITIONS, "pos"), ("🌫️ Arka Plan Saydamlığı", OVERLAY_ALPHAS, "bg"),
                                  ("🔤 Yazı Boyutu", OVERLAY_SIZES, "size")):
             m = self._radio_menu(sub, title, opts, o[key], lambda v, k=key: self.set_overlay(**{k: v}))
             m.setEnabled(styled)
+            styled_menus.append(m)
+        self._menu_sync.append(
+            lambda: [m.setEnabled(self.overlay["mode"] in ("tek", "detay")) for m in styled_menus])
         sub.addSeparator()
         info = sub.addAction("⌨️ Oyunda göster / gizle: Sağ Shift + F12")
         info.setEnabled(False)
