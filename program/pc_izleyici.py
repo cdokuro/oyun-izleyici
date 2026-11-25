@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 IS_WIN = sys.platform.startswith("win")
 
 if IS_WIN:
@@ -64,6 +64,7 @@ BACKUP_DIR = os.path.join(DATA_DIR, "yedekler")
 REPO_DIR = os.path.join(DATA_DIR, "depo")
 MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "github.token")
+KOMUTA_KEY_PATH = os.path.join(CONFIG_DIR, "komuta.key")
 HUD_STOP_FLAG = os.path.join(DATA_DIR, ".hud_stop")
 
 IDLE_THRESHOLD_SEC = 120.0
@@ -71,6 +72,8 @@ POLL_ACTIVE_SEC = 2.0
 POLL_RESOURCE_SEC = 30.0
 POLL_BROWSER_SEC = 25.0
 POLL_AUDIT_SEC = 300.0
+POLL_HEARTBEAT_SEC = 60.0
+POLL_INGEST_SEC = 300.0
 FLUSH_SEC = 30.0
 SYNC_INTERVAL_SEC = 15 * 60
 HUD_IDLE_GRACE_SEC = 45.0
@@ -162,6 +165,208 @@ def read_github_token():
             return f.read().strip()
     except OSError:
         return ""
+
+
+def read_komuta_key():
+    try:
+        with open(KOMUTA_KEY_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _read_live_fps_temp():
+    """Oyun açıkken canlı MangoHud/PresentMon CSV son satırından anlık FPS ve sıcaklık okur (0 maliyet)."""
+    try:
+        csvs = glob.glob(os.path.join(MANGOHUD_DIR, "*.csv"))
+        if not csvs:
+            return None, None, None
+        newest = max(csvs, key=os.path.getmtime)
+        if time.time() - os.path.getmtime(newest) > 8.0:
+            return None, None, None
+        with open(newest, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            sz = f.tell()
+            f.seek(max(0, sz - 2048))
+            chunk = f.read().decode("utf-8", errors="ignore").splitlines()
+        with open(newest, "r", encoding="utf-8", errors="ignore") as f:
+            hdr = ""
+            for _ in range(5):
+                ln = f.readline().strip()
+                if "fps" in ln.lower() and "," in ln:
+                    hdr = ln
+                    break
+        if not hdr or not chunk:
+            return None, None, None
+        cols = [c.strip().lower() for c in hdr.split(",")]
+        for ln in reversed(chunk):
+            parts = ln.strip().split(",")
+            if len(parts) >= len(cols):
+                row = dict(zip(cols, parts))
+                def _f(k):
+                    try:
+                        v = float(row.get(k, ""))
+                        return v if v > 0 else None
+                    except ValueError:
+                        return None
+                return _f("fps"), _f("gpu_temp"), _f("cpu_temp")
+    except Exception:
+        pass
+    return None, None, None
+
+
+class KomutaPusher:
+    """serhatbahar.com/komuta (Pi-hole API) için sessiz 60 sn canlı sağlık nabzı ve toplu aktarım."""
+
+    def __init__(self, store, cfg):
+        self.store = store
+        self.cfg = cfg
+        self.mid = cfg["kimlik"]
+        self._busy_hb = False
+        self._busy_ing = False
+        self._prev_disk_bytes = None
+        self._prev_disk_ts = None
+        self._last_stutter_ts = 0.0
+
+    def _endpoint(self):
+        cfg = load_machine_config()
+        url = (cfg.get("komuta_url") or "").strip().rstrip("/")
+        key = read_komuta_key() or (cfg.get("komuta_key") or "").strip()
+        return url, key, cfg
+
+    def _post(self, url, key, payload, timeout=8):
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=raw, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Komuta-Key": key,
+                "User-Agent": f"oyun-izleyici/{APP_VERSION}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read(256)
+
+    def send_heartbeat(self, active_app="", active_game="", agent_ram_mb=0.0, last_samples=None):
+        if self._busy_hb:
+            return
+        url, key, cfg = self._endpoint()
+        if not url or not key:
+            return
+
+        ram_pct = ram_used = ram_total = cpu_load = disk_pct = uptime_s = None
+        disk_label = "C:" if IS_WIN else "/"
+        warnings = []
+        stutter_event = None
+        if psutil:
+            try:
+                vm = psutil.virtual_memory()
+                ram_pct = round(vm.percent, 1)
+                ram_used = round(vm.used / (1024 ** 3), 2)
+                ram_total = round(vm.total / (1024 ** 3), 1)
+                cpu_load = round(psutil.cpu_percent(interval=None), 1)
+                uptime_s = round(time.time() - psutil.boot_time(), 0)
+                root_path = os.environ.get("SystemDrive", "C:") + "\\" if IS_WIN else "/"
+                du = psutil.disk_usage(root_path)
+                disk_pct = round(du.percent, 1)
+                if disk_pct >= 85:
+                    warnings.append(f"Sistem diski ({disk_label}) %{disk_pct:.0f} dolu")
+                # Oyun sırasında arka plan disk/CPU sıçraması (Stutter Dedektifi)
+                dio = psutil.disk_io_counters()
+                now_m = time.monotonic()
+                disk_mbps = 0.0
+                if dio:
+                    cur_b = dio.read_bytes + dio.write_bytes
+                    if self._prev_disk_bytes is not None and now_m > self._prev_disk_ts:
+                        disk_mbps = max(0.0, (cur_b - self._prev_disk_bytes) / ((now_m - self._prev_disk_ts) * 1048576.0))
+                    self._prev_disk_bytes = cur_b
+                    self._prev_disk_ts = now_m
+                if active_game and last_samples and (time.time() - self._last_stutter_ts) > 180:
+                    culprits = [
+                        (app, m) for app, m in last_samples.items()
+                        if app != active_game and (m.get("cpu_pct", 0) >= 18.0 or (disk_mbps >= 80.0 and m.get("cpu_pct", 0) >= 5.0))
+                    ]
+                    if culprits:
+                        culprits.sort(key=lambda kv: kv[1].get("cpu_pct", 0), reverse=True)
+                        c_app, cm = culprits[0]
+                        self._last_stutter_ts = time.time()
+                        stutter_event = {
+                            "ts": time.time(),
+                            "title": f"{active_game} sırasında arka plan yükü: {c_app}",
+                            "detail": f"Oyun açıkken {c_app} işlemciyi %{cm.get('cpu_pct', 0):.0f} (RAM {fmt_mb_tr(cm.get('ram_mb', 0))}, toplam disk {disk_mbps:.0f} MB/s) kullandı.",
+                        }
+                        self.store.add_event("stutter", stutter_event["title"], stutter_event["detail"], "important")
+            except Exception:
+                pass
+
+        fps, gpu_temp, cpu_temp = _read_live_fps_temp()
+        if gpu_temp is None and not IS_WIN:
+            # Linux amdgpu / thermal_zone hızlı okuma
+            for p in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input"):
+                try:
+                    gpu_temp = round(int(open(p).read().strip()) / 1000.0, 1)
+                    break
+                except OSError:
+                    pass
+
+        payload = {
+            "machine_id": self.mid,
+            "name": cfg.get("ad") or self.mid,
+            "gpu_temp": gpu_temp,
+            "cpu_temp": cpu_temp,
+            "cpu_load": cpu_load,
+            "ram_pct": ram_pct,
+            "ram_used_gb": ram_used,
+            "ram_total_gb": ram_total,
+            "disk_pct": disk_pct,
+            "disk_label": disk_label,
+            "active_app": active_app,
+            "active_game": active_game,
+            "fps": fps,
+            "agent_ram_mb": round(agent_ram_mb, 1),
+            "uptime_s": uptime_s,
+            "warnings": warnings,
+            "stutter_event": stutter_event,
+        }
+        self._busy_hb = True
+
+        def _work():
+            try:
+                self._post(f"{url}/heartbeat", key, payload)
+            except Exception:
+                pass
+            finally:
+                self._busy_hb = False
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def send_ingest(self):
+        if self._busy_ing:
+            return
+        url, key, _cfg = self._endpoint()
+        if not url or not key:
+            return
+        bundle = self.store.export_activity_bundle()
+        evts = [
+            json.loads(ln) for ln in self.store.export_events_lines().splitlines() if ln.strip()
+        ]
+        payload = {
+            "machine_id": self.mid,
+            "activity": bundle.get("activity") or [],
+            "resources": bundle.get("resources") or [],
+            "events": evts[-250:],
+        }
+        self._busy_ing = True
+
+        def _work():
+            try:
+                self._post(f"{url}/ingest", key, payload, timeout=15)
+            except Exception:
+                pass
+            finally:
+                self._busy_ing = False
+
+        threading.Thread(target=_work, daemon=True).start()
 
 
 def fmt_duration_tr(sec, short=False):
@@ -2265,6 +2470,7 @@ if IS_WIN:
         """Hafif Win32 sistem tepsisi (Qt gerektirmez)."""
 
         CMD_DASHBOARD = 1001
+        CMD_WEB_KOMUTA = 1007
         CMD_TOGGLE_HUD = 1002
         CMD_TOGGLE_AUTO = 1003
         CMD_TOGGLE_ALWAYS = 1004
@@ -2369,6 +2575,7 @@ if IS_WIN:
 
             self._u32.AppendMenuW(menu, MF_STRING, self.CMD_DASHBOARD, "📊 PC Aktivite && Oyun Raporu…")
             self._u32.SetMenuDefaultItem(menu, self.CMD_DASHBOARD, 0)
+            self._u32.AppendMenuW(menu, MF_STRING, self.CMD_WEB_KOMUTA, "🌐 Web Komuta Merkezi (serhatbahar.com/komuta)")
             self._u32.AppendMenuW(
                 menu, MF_STRING, self.CMD_TOGGLE_HUD,
                 "🎮 Canlı Oyun HUD'unu Kapat" if hud_on else "🎮 Canlı Oyun HUD'unu Aç",
@@ -2410,6 +2617,9 @@ if IS_WIN:
                 cmd = wp & 0xFFFF
                 if cmd == self.CMD_DASHBOARD:
                     self.daemon.launch_dashboard()
+                elif cmd == self.CMD_WEB_KOMUTA:
+                    import webbrowser
+                    webbrowser.open("https://serhatbahar.com/komuta/")
                 elif cmd == self.CMD_TOGGLE_HUD:
                     self.daemon.toggle_hud_manual()
                 elif cmd == self.CMD_TOGGLE_AUTO:
@@ -2479,6 +2689,7 @@ class PCActivityDaemon:
         self.browser = BrowserDomainResolver()
         self.res_sampler = ResourceSampler()
         self.sync = DaemonSync(self.store, self.cfg)
+        self.komuta = KomutaPusher(self.store, self.cfg)
         self.tray = WinTrayController(self) if IS_WIN else None
         self.stop_requested = False
 
@@ -2486,12 +2697,16 @@ class PCActivityDaemon:
         self._buf_act = {}  # (day, kind, name) -> [cat, secs, visits, title, ts]
         self._last_app = None
         self._last_domain = None
+        self._last_game_name = ""
+        self._last_res_samples = None
         self._last_poll_ts = time.time()
         self._next_poll = 0.0
         self._next_res = time.time() + 8.0
         self._next_browser = time.time() + 4.0
         self._next_audit = time.time() + 6.0
         self._next_flush = time.time() + FLUSH_SEC
+        self._next_hb = time.time() + 12.0
+        self._next_ingest = time.time() + 25.0
         self._next_tip = time.time() + 5.0
 
         # Çocuk HUD & Dashboard süreç yönetimi
@@ -2643,8 +2858,12 @@ class PCActivityDaemon:
         # Oyun algılama → otomatik HUD (Windows süreç/klasör + Linux MangoHud canlı log)
         if is_game or (not IS_WIN and self._linux_mangohud_active()):
             self._last_game_seen_ts = now
+            if is_game:
+                self._last_game_name = app_name
             if self.cfg.get("hud_oto", "acik") != "kapali" and not self.is_hud_running():
                 self.ensure_hud_running(auto=True)
+        elif now - self._last_game_seen_ts > HUD_IDLE_GRACE_SEC:
+            self._last_game_name = ""
 
     def _check_auto_hud(self, now):
         if self.cfg.get("hud_hep_acik", "kapali") == "acik":
@@ -2713,6 +2932,7 @@ class PCActivityDaemon:
             try:
                 samples = self.res_sampler.sample(self.auditor.known_games)
                 if samples:
+                    self._last_res_samples = samples
                     self.store.flush_resources(today_str(now), samples)
             except Exception:
                 pass
@@ -2731,6 +2951,26 @@ class PCActivityDaemon:
             self.sync.maybe_sync(force=False)
             trim_memory()
 
+        if now >= self._next_hb:
+            self._next_hb = now + POLL_HEARTBEAT_SEC
+            try:
+                self.komuta.send_heartbeat(
+                    active_app=self._current_label,
+                    active_game=self._last_game_name,
+                    agent_ram_mb=self.self_ram_mb(),
+                    last_samples=self._last_res_samples,
+                )
+            except Exception:
+                pass
+
+        if now >= self._next_ingest:
+            self._next_ingest = now + POLL_INGEST_SEC
+            try:
+                self.flush_now()
+                self.komuta.send_ingest()
+            except Exception:
+                pass
+
         if self.tray and now >= self._next_tip:
             self._next_tip = now + 8.0
             hud_tag = " · HUD Açık" if self.is_hud_running() else ""
@@ -2739,24 +2979,7 @@ class PCActivityDaemon:
             )
 
     def run(self):
-        # Linux'ta ilk açılış/güncellemede eksik bağımlılık (psutil/kdotool/xdotool) varsa kullanıcıya sor
-        if not IS_WIN and self.cfg.get("linux_deps_sor", "acik") != "kapali":
-            desk = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
-            need_win_tool = (
-                not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-                and (
-                    (bool(os.environ.get("WAYLAND_DISPLAY")) and "kde" in desk and not shutil.which("kdotool"))
-                    or (not (bool(os.environ.get("WAYLAND_DISPLAY")) and "kde" in desk) and not shutil.which("xdotool"))
-                )
-            )
-            if psutil is None or need_win_tool:
-                if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-                    try:
-                        subprocess.Popen([self._python_exe(), self.app_script, "--deps-check"], close_fds=True)
-                    except Exception:
-                        pass
-
-        # İlk açılışta HUD hep açık seçiliyse başlat
+        # İlk açılışta HUD hep açık seçiliyse başlat (tamamen sessiz, sıfır pop-up!)
         if self.cfg.get("hud_hep_acik", "kapali") == "acik":
             self.ensure_hud_running(auto=False)
         elif self.cfg.get("hud_oto", "acik") != "kapali" and self._any_game_process_running():
