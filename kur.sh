@@ -210,6 +210,15 @@ systemctl --user enable systemd-tmpfiles-setup.service >/dev/null 2>&1 || true
 mkdir -p /tmp/mangohud_live
 
 # --- 5. Menü + otomatik başlatma ----------------------------------------------
+if [[ -n "${OI_KOMUTA_URL:-}" ]]; then
+    grep -v '^komuta_url' "$CONF_DIR/makine.conf" 2>/dev/null > "$CONF_DIR/makine.conf.tmp" || true
+    echo "komuta_url = ${OI_KOMUTA_URL}" >> "$CONF_DIR/makine.conf.tmp"
+    mv "$CONF_DIR/makine.conf.tmp" "$CONF_DIR/makine.conf"
+fi
+if [[ -n "${OI_KOMUTA_KEY:-}" ]]; then
+    printf '%s\n' "$OI_KOMUTA_KEY" > "$CONF_DIR/komuta.key"
+    chmod 600 "$CONF_DIR/komuta.key"
+fi
 say "Uygulama menüsü ve otomatik başlatma"
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config/autostart"
 write_desktop() {  # $1 = hedef dosya, $2 = Exec satırı, $3 = ek satırlar
