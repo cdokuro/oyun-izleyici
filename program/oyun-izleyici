@@ -18,7 +18,7 @@ import time
 import math
 from collections import deque
 
-APP_VERSION = "3.0.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.0.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
@@ -29,6 +29,26 @@ if IS_WIN:
 else:
     import fcntl
     _LOCAL = _ROAM = None
+
+# =============================================================================
+# HAFİF ARKA PLAN BAŞLATICISI (v4.0) — PySide6 YÜKLENMEDEN ÖNCE KONTROL EDİLİR!
+# UI bayrağı (--hud / --dashboard / --tani / --snapshot / --eski) yoksa
+# ~20 MB RAM ile 7/24 çalışan pc_izleyici arka plan servisini başlatır.
+# =============================================================================
+_UI_FLAGS = {"--hud", "--dashboard", "--rapor", "--sync", "--tani", "--snapshot", "--eski", "--auto-hud"}
+if __name__ == "__main__" and not (set(sys.argv[1:]) & _UI_FLAGS):
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isfile(os.path.join(_app_dir, "pc_izleyici.py")):
+        if _app_dir not in sys.path:
+            sys.path.insert(0, _app_dir)
+        try:
+            import pc_izleyici as _pci
+            _dcfg = _pci.load_machine_config()
+            if _dcfg.get("hafif_mod", "acik") != "kapali":
+                _pci.run_daemon(os.path.abspath(__file__))
+                sys.exit(0)
+        except Exception as _e:
+            print(f"[oyun-izleyici] hafif servis başlatılamadı, normal moda geçiliyor: {_e}", file=sys.stderr)
 
 # Kare kayıtları <oyun>_<tarih>.csv: Linux'ta MangoHud (görünmez HUD + autostart_log), Windows'ta PresentMon köprüsü yazar
 MANGOHUD_DIR = os.path.join(_LOCAL, "oyun-izleyici", "canli") if IS_WIN else "/tmp/mangohud_live"
@@ -568,7 +588,8 @@ class SessionStore:
                     machine_id TEXT PRIMARY KEY, name TEXT, gpu TEXT, cpu TEXT, ram TEXT,
                     os TEXT, has_battery INTEGER
                 )""")
-            self.db.execute("PRAGMA user_version=3")
+            if ver < 3:
+                self.db.execute("PRAGMA user_version=3")
             # Mevcut oturumlardaki birleşik oyun adlarını (ör. DOOMTHEDARKAGES) log dosya adından veya sözlükten düzelt
             for r in self.db.execute("SELECT id, game, log_file FROM sessions").fetchall():
                 nice = game_name_from_log(r["log_file"]) if r["log_file"] else format_game_title(r["game"])
@@ -1266,14 +1287,15 @@ class SyncManager:
                         if "HTTP 404" not in str(e):
                             raise
 
-            # 3) Depoda program/oyun-izleyici varsa yerel kopyasını güncelle (tek tık güncelleme rozeti için)
-            try:
-                prog_txt, _ = self._api_read_file(slug, "program/oyun-izleyici", branch, token)
-                if prog_txt is not None:
-                    self._write_if_changed(os.path.join(REPO_DIR, "program", "oyun-izleyici"), prog_txt)
-            except RuntimeError as e:
-                if "HTTP 404" not in str(e):
-                    raise
+            # 3) Depoda program/oyun-izleyici ve pc_izleyici.py varsa yerel kopyasını güncelle
+            for rel_p, loc_p in (("program/oyun-izleyici", "oyun-izleyici"), ("program/pc_izleyici.py", "pc_izleyici.py")):
+                try:
+                    prog_txt, _ = self._api_read_file(slug, rel_p, branch, token)
+                    if prog_txt is not None:
+                        self._write_if_changed(os.path.join(REPO_DIR, "program", loc_p), prog_txt)
+                except RuntimeError as e:
+                    if "HTTP 404" not in str(e):
+                        raise
 
             self._result = (True, None)
         except Exception as e:
@@ -1309,6 +1331,10 @@ def apply_app_update(parent_win=None):
             shutil.copy2(inst_bin, f"{inst_bin}.yedek-{ts}")
         shutil.copy2(repo_bin, inst_bin)
         os.chmod(inst_bin, 0o755)
+        repo_daemon = os.path.join(REPO_DIR, "program", "pc_izleyici.py")
+        if os.path.isfile(repo_daemon):
+            inst_daemon = os.path.join(os.path.dirname(inst_bin), "pc_izleyici.py")
+            shutil.copy2(repo_daemon, inst_daemon)
     except Exception as e:
         notify("Oyun İzleyici — Güncelleme Hatası", str(e))
         return
@@ -3643,30 +3669,50 @@ class CompareBarWidget(QWidget):
 
 
 class HistoryWindow(QWidget):
-    def __init__(self, store, sync=None, theme="klasik", accent_hex="#40ff70"):
+    def __init__(self, store, sync=None, theme="klasik", accent_hex="#40ff70", default_tab="summary"):
         from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QTableWidget,
-                                       QPushButton, QComboBox, QAbstractItemView, QHeaderView, QCheckBox, QFrame)
+                                       QPushButton, QComboBox, QAbstractItemView, QHeaderView,
+                                       QCheckBox, QFrame, QLineEdit, QSplitter, QScrollArea)
         super().__init__()
         self.store = store
         self.sync = sync
         self.theme = theme if theme in ("klasik", "edna") else "klasik"
         self.accent_hex = accent_hex or "#40ff70"
-        self.setWindowTitle("Oyun Geçmişi — Oyun İzleyici")
-        self.resize(1240, 700)
+        self._act_store = None
+        self._pci = None
+        try:
+            _app_d = os.path.dirname(os.path.abspath(__file__))
+            if _app_d not in sys.path:
+                sys.path.insert(0, _app_d)
+            import pc_izleyici as _pci_mod
+            self._pci = _pci_mod
+            self._act_store = _pci_mod.ActivityStore(self.store.machine_id, path=self.store.path)
+        except Exception:
+            self._act_store = None
+        self.setWindowTitle("Oyun & PC İzleyici — Aktivite, Özet ve Oyun Raporu")
+        self.resize(1320, 760)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 12)
         root.setSpacing(10)
 
         top = QHBoxLayout()
-        title = QLabel("OYUN GEÇMİŞİ")
+        title = QLabel("OYUN & PC İZLEYİCİ")
         title.setObjectName("title")
         top.addWidget(title)
-        top.addSpacing(20)
+        top.addSpacing(18)
         top.addWidget(QLabel("PC:"))
         self.pc_combo = QComboBox()
         self.pc_combo.currentIndexChanged.connect(self._fill_all)
         top.addWidget(self.pc_combo)
+        top.addSpacing(12)
+        top.addWidget(QLabel("Dönem:"))
+        self.period_combo = QComboBox()
+        for lbl, dval in (("Bugün", 1), ("Son 7 Gün", 7), ("Son 30 Gün", 30), ("Tüm Zamanlar", 0)):
+            self.period_combo.addItem(lbl, dval)
+        self.period_combo.setCurrentIndex(1)  # Varsayılan: Son 7 Gün
+        self.period_combo.currentIndexChanged.connect(self._fill_pc_activity)
+        top.addWidget(self.period_combo)
         top.addStretch(1)
         self.totals_lbl = QLabel()
         self.totals_lbl.setObjectName("totals")
@@ -3676,16 +3722,77 @@ class HistoryWindow(QWidget):
         self.tabs = QTabWidget()
         root.addWidget(self.tabs, 1)
 
+        # --- Sekme 0: PC & Oyun Özeti (Günlük / Haftalık Doğal Türkçe Özet) ---
+        self._summary_page = QWidget()
+        sum_v = QVBoxLayout(self._summary_page)
+        sum_v.setContentsMargins(10, 10, 10, 8)
+        sum_v.setSpacing(10)
+
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(10)
+        self._kpi_cards = {}
+        for key, heading in (
+            ("active_str", "⏱️ AKTİF SÜRE"),
+            ("game_str", "🎮 OYUN SÜRESİ"),
+            ("top_web", "🌐 EN ÇOK SİTE"),
+            ("top_ram", "🧠 RAM LİDERİ"),
+            ("events_count", "📦 OLAY / KURULUM"),
+        ):
+            card = QFrame()
+            card.setObjectName("cmpBanner")
+            cl_v = QVBoxLayout(card)
+            cl_v.setContentsMargins(12, 8, 12, 8)
+            cl_v.setSpacing(2)
+            h_lbl = QLabel(heading)
+            h_lbl.setObjectName("footer")
+            v_lbl = QLabel("—")
+            v_lbl.setStyleSheet("font-size: 15px; font-weight: 700;")
+            cl_v.addWidget(h_lbl)
+            cl_v.addWidget(v_lbl)
+            kpi_row.addWidget(card, 1)
+            self._kpi_cards[key] = v_lbl
+        sum_v.addLayout(kpi_row)
+
+        self.digest_lbl = QLabel()
+        self.digest_lbl.setObjectName("gameSummary")
+        self.digest_lbl.setWordWrap(True)
+        self.digest_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.digest_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        sum_v.addWidget(self.digest_lbl)
+
+        prev_split = QSplitter(Qt.Orientation.Horizontal)
+        left_prev = QWidget()
+        lp_v = QVBoxLayout(left_prev)
+        lp_v.setContentsMargins(0, 0, 4, 0)
+        lp_v.addWidget(QLabel("En Çok Kullanılan Uygulamalar & Siteler"))
+        self.sum_top_tbl = QTableWidget(0, 4)
+        self.sum_top_tbl.setHorizontalHeaderLabels(["Tür", "Ad / Site", "Süre", "Ziyaret"])
+        lp_v.addWidget(self.sum_top_tbl, 1)
+        prev_split.addWidget(left_prev)
+
+        right_prev = QWidget()
+        rp_v = QVBoxLayout(right_prev)
+        rp_v.setContentsMargins(4, 0, 0, 0)
+        rp_v.addWidget(QLabel("Son Kurulumlar & Kritik Değişiklikler"))
+        self.sum_evt_tbl = QTableWidget(0, 3)
+        self.sum_evt_tbl.setHorizontalHeaderLabels(["Tarih", "Olay", "Detay"])
+        rp_v.addWidget(self.sum_evt_tbl, 1)
+        prev_split.addWidget(right_prev)
+        prev_split.setSizes([640, 640])
+        sum_v.addWidget(prev_split, 1)
+        self.tabs.addTab(self._summary_page, "📋 Özet")
+
         # --- Sekme 1: Oyunlar (oyun başına toplam + ortalama) ---
         self.games_tbl = QTableWidget(0, 9)
         self.games_tbl.setHorizontalHeaderLabels([
             "Oyun", "Toplam Süre", "Oturum", "Ort. FPS", "Ort. 1% Low", "En İyi Ort. FPS",
             "GPU Maks °C", "İlk Oynama", "Son Oynama"])
-        self.tabs.addTab(self.games_tbl, "Oyunlar (Toplam)")
+        self.tabs.addTab(self.games_tbl, "🎮 Oyunlar")
         self.games_tbl.cellDoubleClicked.connect(self._open_game_sessions)
 
         # --- Sekme 2: Oturumlar (her açılış ayrı) ---
         sess_page = QWidget()
+        self._sess_page = sess_page
         sv = QVBoxLayout(sess_page)
         sv.setContentsMargins(8, 10, 8, 8)
         fl = QHBoxLayout()
@@ -3712,10 +3819,11 @@ class HistoryWindow(QWidget):
         sv.addWidget(self.sess_tbl, 1)
         self.timeline_widget = SessionTimelineWidget()
         sv.addWidget(self.timeline_widget)
-        self.tabs.addTab(sess_page, "Oturumlar (Tek Tek)")
+        self.tabs.addTab(sess_page, "📜 Oturumlar")
 
         # --- Sekme 3: PC Karşılaştırma ---
         cmp_page = QWidget()
+        self._cmp_page = cmp_page
         cv = QVBoxLayout(cmp_page)
         cv.setContentsMargins(8, 10, 8, 8)
 
@@ -3767,12 +3875,83 @@ class HistoryWindow(QWidget):
         self.cmp_note.setObjectName("footer")
         self.cmp_note.setWordWrap(True)
         cv.addWidget(self.cmp_note)
-        self.tabs.addTab(cmp_page, "PC Karşılaştırma")
+        self.tabs.addTab(cmp_page, "⚖️ PC Karşılaştırma")
         for w in (self.cmp_a, self.cmp_b):
             w.currentIndexChanged.connect(self._fill_compare)
         self.cmp_ac.toggled.connect(self._fill_compare)
 
-        for tbl in (self.games_tbl, self.sess_tbl, self.cmp_tbl):
+        # --- Sekme 4: Uygulamalar & Web Siteleri ---
+        self._apps_web_page = QWidget()
+        aw_v = QVBoxLayout(self._apps_web_page)
+        aw_v.setContentsMargins(8, 10, 8, 8)
+        aw_split = QSplitter(Qt.Orientation.Horizontal)
+
+        app_box = QWidget()
+        ab_v = QVBoxLayout(app_box)
+        ab_v.setContentsMargins(0, 0, 4, 0)
+        ab_v.addWidget(QLabel("Uygulama Kullanım Süreleri"))
+        self.apps_tbl = QTableWidget(0, 5)
+        self.apps_tbl.setHorizontalHeaderLabels(["Uygulama", "Kategori", "Aktif Süre", "Pay %", "Son Başlık"])
+        ab_v.addWidget(self.apps_tbl, 1)
+        aw_split.addWidget(app_box)
+
+        web_box = QWidget()
+        wb_v = QVBoxLayout(web_box)
+        wb_v.setContentsMargins(4, 0, 0, 0)
+        wb_v.addWidget(QLabel("Web Siteleri (Chrome / Edge / Firefox / Zen)"))
+        self.web_tbl = QTableWidget(0, 4)
+        self.web_tbl.setHorizontalHeaderLabels(["Web Sitesi", "Aktif Süre", "Ziyaret", "Son Sayfa"])
+        wb_v.addWidget(self.web_tbl, 1)
+        aw_split.addWidget(web_box)
+        aw_split.setSizes([640, 640])
+        aw_v.addWidget(aw_split, 1)
+        self.tabs.addTab(self._apps_web_page, "⏱️ Uygulama & Web")
+
+        # --- Sekme 5: Kurulumlar & Kritik Değişiklikler ---
+        self._events_page = QWidget()
+        ev_v = QVBoxLayout(self._events_page)
+        ev_v.setContentsMargins(8, 10, 8, 8)
+        ef = QHBoxLayout()
+        ef.addWidget(QLabel("Filtre:"))
+        self.evt_kind_combo = QComboBox()
+        for lbl, val in (
+            ("Tümü", "tumu"),
+            ("Kurulum & Güncelleme", "kurulum"),
+            ("Kritik Değişiklikler", "kritik"),
+            ("İndirilen Dosyalar", "dosya_indirildi"),
+            ("Sistem", "sistem"),
+        ):
+            self.evt_kind_combo.addItem(lbl, val)
+        self.evt_kind_combo.currentIndexChanged.connect(self._fill_events)
+        ef.addWidget(self.evt_kind_combo)
+        ef.addSpacing(12)
+        self.evt_search = QLineEdit()
+        self.evt_search.setPlaceholderText("Program, oyun, sürücü veya dosya ara…")
+        self.evt_search.textChanged.connect(self._fill_events)
+        ef.addWidget(self.evt_search, 1)
+        ev_v.addLayout(ef)
+        self.evt_tbl = QTableWidget(0, 5)
+        self.evt_tbl.setHorizontalHeaderLabels(["Tarih", "PC", "Tür", "Olay", "Detay"])
+        ev_v.addWidget(self.evt_tbl, 1)
+        self.tabs.addTab(self._events_page, "📦 Kurulum & Değişiklik")
+
+        # --- Sekme 6: Uygulama Bazlı RAM & GPU Tüketimi ---
+        self._res_page = QWidget()
+        rv = QVBoxLayout(self._res_page)
+        rv.setContentsMargins(8, 10, 8, 8)
+        self.res_summary = QLabel("Uygulamaların ortalama ve zirve RAM, GPU % ve adanmış VRAM tüketimleri.")
+        self.res_summary.setObjectName("gameSummary")
+        self.res_summary.setWordWrap(True)
+        rv.addWidget(self.res_summary)
+        self.res_tbl = QTableWidget(0, 9)
+        self.res_tbl.setHorizontalHeaderLabels([
+            "Uygulama", "Ort. RAM", "Maks. RAM", "Ort. GPU %", "Maks. GPU %",
+            "Ort. VRAM", "Maks. VRAM", "Ort. CPU %", "Örnek"])
+        rv.addWidget(self.res_tbl, 1)
+        self.tabs.addTab(self._res_page, "🧠 RAM & GPU Tüketimi")
+
+        for tbl in (self.games_tbl, self.sess_tbl, self.cmp_tbl, self.sum_top_tbl, self.sum_evt_tbl,
+                    self.apps_tbl, self.web_tbl, self.evt_tbl, self.res_tbl):
             tbl.horizontalHeader().sectionClicked.connect(lambda _c, t=tbl: setattr(t, "_user_sorted", True))
             tbl.setAlternatingRowColors(True)
             tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -3785,30 +3964,38 @@ class HistoryWindow(QWidget):
         self.sess_tbl.horizontalHeader().setSectionResizeMode(len(self.SESS_COLS) - 1, QHeaderView.ResizeMode.Stretch)
         self.cmp_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.cmp_tbl.setColumnWidth(0, 200)
+        self.sum_top_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.sum_evt_tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.apps_tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.web_tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.evt_tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.res_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
         btns = QHBoxLayout()
+        b_md = QPushButton("📄 Özet Raporu (.md)")
+        b_md.clicked.connect(self._export_markdown)
         b_del = QPushButton("Seçili Oturumu Sil")
         b_del.setObjectName("danger")
         b_del.clicked.connect(self._delete_selected)
-        b_csv = QPushButton("CSV Olarak Dışa Aktar")
+        b_csv = QPushButton("Oyun CSV")
         b_csv.clicked.connect(self._export_csv)
-        b_bak = QPushButton("Şimdi Yedekle")
+        b_bak = QPushButton("Yedekle")
         b_bak.clicked.connect(self._backup_now)
-        self.b_sync = QPushButton("GitHub ile Senkronize Et")
+        self.b_sync = QPushButton("🔄 Senkronize Et")
         self.b_sync.clicked.connect(self._sync_now)
         self.b_repo = QPushButton("🔗 Depo Bağla")
         self.b_repo.clicked.connect(self._open_sync_setup)
-        self.b_upd = QPushButton("⬆ Uygulamayı Şimdi Güncelle")
+        self.b_upd = QPushButton("⬆ Güncelle")
         self.b_upd.setObjectName("primary")
         self.b_upd.clicked.connect(lambda: apply_app_update())
         self.b_upd.setVisible(bool(self.sync and self.sync.update_available))
-        b_dir = QPushButton("Kayıt Klasörünü Aç")
+        b_dir = QPushButton("Klasör")
         b_dir.clicked.connect(self._open_folder)
-        b_help = QPushButton("📖 Kısayollar ve Rehber")
+        b_help = QPushButton("📖 Rehber")
         b_help.clicked.connect(lambda: show_shortcuts_guide(self, self.accent_hex, self.theme))
         b_ref = QPushButton("Yenile")
         b_ref.clicked.connect(self.refresh)
-        for b in (b_del, b_csv, b_bak, self.b_sync, self.b_repo, self.b_upd, b_dir, b_help):
+        for b in (b_md, b_del, b_csv, b_bak, self.b_sync, self.b_repo, self.b_upd, b_dir, b_help):
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(b_ref)
@@ -3820,6 +4007,11 @@ class HistoryWindow(QWidget):
         self.footer = QLabel()
         self.footer.setObjectName("footer")
         root.addWidget(self.footer)
+
+        if default_tab == "games":
+            self.tabs.setCurrentWidget(self.games_tbl)
+        elif default_tab == "compare":
+            self.tabs.setCurrentWidget(self._cmp_page)
 
         self.apply_theme(self.theme, self.accent_hex)
         self.refresh_timer = QTimer(self)
@@ -3839,7 +4031,7 @@ class HistoryWindow(QWidget):
             self._fill_compare()
 
     def open_compare(self):
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentWidget(self._cmp_page)
         if self.cmp_a.count() >= 2 and self.cmp_a.currentData() == self.cmp_b.currentData():
             self.cmp_a.setCurrentIndex(0)
             self.cmp_b.setCurrentIndex(1)
@@ -3955,6 +4147,7 @@ class HistoryWindow(QWidget):
                           [(g, g) for g in sorted(r["game"] for r in games)], keep=True)
         self._fill_sessions()
         self._fill_compare()
+        self._fill_pc_activity()
 
         if self.sync is not None:
             self.sync_lbl.setText(self.sync.status_text())
@@ -4125,7 +4318,7 @@ class HistoryWindow(QWidget):
             idx = self.game_combo.findData(it.text())
             if idx >= 0:
                 self.game_combo.setCurrentIndex(idx)
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self._sess_page)
 
     # --- işlemler ---
     def _selected_session(self):
@@ -4155,7 +4348,7 @@ class HistoryWindow(QWidget):
 
     def _delete_selected(self):
         from PySide6.QtWidgets import QMessageBox
-        sel = self._selected_session() if self.tabs.currentIndex() == 1 else None
+        sel = self._selected_session() if self.tabs.currentWidget() is self._sess_page else None
         if sel is None:
             QMessageBox.information(self, "Oturum Sil", "Silmek için 'Oturumlar' sekmesinde bir satır seç.")
             return
@@ -4201,6 +4394,177 @@ class HistoryWindow(QWidget):
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
         QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR))
+
+    # --- PC Aktivite / Web / Kurulum / RAM-GPU Sekmeleri (v4) ---
+    _EVT_BADGES = {
+        "program_kuruldu": "🆕 Program Kuruldu",
+        "program_guncellendi": "⬆️ Program Güncellendi",
+        "program_kaldirildi": "🗑️ Program Kaldırıldı",
+        "oyun_kuruldu": "🎮 Oyun Kuruldu",
+        "oyun_guncellendi": "🎮 Oyun Güncellendi",
+        "oyun_kaldirildi": "🗑️ Oyun Kaldırıldı",
+        "kritik_degisiklik": "⚠️ Kritik Değişiklik",
+        "dosya_indirildi": "⬇️ İndirilen Dosya",
+        "sistem": "ℹ️ Sistem",
+    }
+
+    def _period_days(self):
+        d = self.period_combo.currentData() if hasattr(self, "period_combo") else 7
+        return 7 if d is None else int(d)
+
+    def _fill_pc_activity(self):
+        if self._act_store is None or self._pci is None:
+            self.digest_lbl.setText("Hafif arka plan izleyici modülü (pc_izleyici.py) henüz yüklenmedi.")
+            return
+        pci = self._pci
+        machine = self._machine()
+        days = self._period_days()
+        I = self._item
+        try:
+            digest = pci.SummaryEngine.build_digest(self._act_store, machine=machine, days=days)
+        except Exception as e:
+            self.digest_lbl.setText(f"Özet oluşturulamadı: {e}")
+            return
+
+        # 1) KPI Kartları
+        kpis = digest["kpis"]
+        self._kpi_cards["active_str"].setText(kpis["active_str"])
+        self._kpi_cards["game_str"].setText(kpis["game_str"])
+        self._kpi_cards["top_web"].setText(kpis["top_web"])
+        self._kpi_cards["top_ram"].setText(kpis["top_ram"])
+        self._kpi_cards["events_count"].setText(
+            f"{kpis['installs_count']} kurulum · {kpis['critical_count']} kritik"
+        )
+
+        # 2) Doğal Türkçe Özet Metni
+        bullets_html = "<br>".join(f"• {b}" for b in digest["bullets"])
+        self.digest_lbl.setText(
+            f"<div style='line-height:1.45;'><b>{digest['label']} — PC & Oyun Özeti</b><br>{bullets_html}</div>"
+        )
+
+        # 3) Özet Sekmesi Alt Tabloları (İlk Uygulamalar + Webler ve Son Olaylar)
+        top_rows = []
+        for a in digest["apps"][:8]:
+            top_rows.append([
+                I(a["category"], a["category"], align_right=False),
+                I(a["name"], a["name"], align_right=False),
+                I(pci.fmt_duration_tr(a["secs"]), a["secs"]),
+                I(str(a["visits"]), a["visits"]),
+            ])
+        for w in digest["webs"][:8]:
+            top_rows.append([
+                I("🌐 Web", "Web", align_right=False),
+                I(w["domain"], w["domain"], align_right=False),
+                I(pci.fmt_duration_tr(w["secs"]) if w["secs"] >= 5 else "—", w["secs"]),
+                I(str(w["visits"]), w["visits"]),
+            ])
+        self._fill_table(self.sum_top_tbl, top_rows, (2, Qt.SortOrder.DescendingOrder))
+
+        se_rows = []
+        for e in digest["events"][:15]:
+            se_rows.append([
+                I(_date(e["ts"]), e["ts"], align_right=False),
+                I(e["title"], e["title"], align_right=False),
+                I(e["detail"] or "", e["detail"] or "", align_right=False),
+            ])
+        self._fill_table(self.sum_evt_tbl, se_rows, (0, Qt.SortOrder.DescendingOrder))
+
+        # 4) Uygulamalar & Web Sekmesi
+        all_apps = self._act_store.top_apps(machine, days, limit=80)
+        tot_app_sec = sum(float(a["secs"] or 0) for a in all_apps) or 1.0
+        app_rows = []
+        for a in all_apps:
+            pct = (float(a["secs"] or 0) / tot_app_sec) * 100.0
+            app_rows.append([
+                I(a["name"], a["name"], align_right=False),
+                I(a["category"], a["category"], align_right=False),
+                I(pci.fmt_duration_tr(a["secs"]), a["secs"]),
+                I(f"%{pct:.1f}", pct),
+                I((a["last_title"] or "")[:90], a["last_title"] or "", align_right=False),
+            ])
+        self._fill_table(self.apps_tbl, app_rows, (2, Qt.SortOrder.DescendingOrder))
+
+        all_webs = self._act_store.top_websites(machine, days, limit=100)
+        web_rows = []
+        for w in all_webs:
+            web_rows.append([
+                I(w["domain"], w["domain"], align_right=False),
+                I(pci.fmt_duration_tr(w["secs"]) if w["secs"] >= 5 else "—", w["secs"]),
+                I(str(w["visits"]), w["visits"]),
+                I((w["last_title"] or "")[:90], w["last_title"] or "", align_right=False),
+            ])
+        self._fill_table(self.web_tbl, web_rows, (1, Qt.SortOrder.DescendingOrder))
+
+        # 5) RAM & GPU Tüketimi Sekmesi
+        res_list = self._act_store.top_resources(machine, days, limit=60)
+        res_rows = []
+        for r in res_list:
+            res_rows.append([
+                I(r["app"], r["app"], align_right=False),
+                I(pci.fmt_mb_tr(r["avg_ram_mb"]), r["avg_ram_mb"] or 0),
+                I(pci.fmt_mb_tr(r["max_ram_mb"]), r["max_ram_mb"] or 0),
+                I(f"%{r['avg_gpu_pct']:.1f}", r["avg_gpu_pct"] or 0),
+                I(f"%{r['max_gpu_pct']:.0f}", r["max_gpu_pct"] or 0),
+                I(pci.fmt_mb_tr(r["avg_vram_mb"]), r["avg_vram_mb"] or 0),
+                I(pci.fmt_mb_tr(r["max_vram_mb"]), r["max_vram_mb"] or 0),
+                I(f"%{r['avg_cpu_pct']:.1f}", r["avg_cpu_pct"] or 0),
+                I(str(r["samples"]), r["samples"] or 0),
+            ])
+        self._fill_table(self.res_tbl, res_rows, (1, Qt.SortOrder.DescendingOrder))
+        if res_list:
+            top_r = res_list[0]
+            top_g = max(res_list, key=lambda x: (x["max_vram_mb"] or 0) + (x["avg_gpu_pct"] or 0) * 50)
+            self.res_summary.setText(
+                f"{digest['label']} · En yüksek ortalama RAM: {top_r['app']} ({pci.fmt_mb_tr(top_r['avg_ram_mb'])}, "
+                f"zirve {pci.fmt_mb_tr(top_r['max_ram_mb'])})   ·   "
+                f"En yüksek GPU/VRAM: {top_g['app']} (ort. %{top_g['avg_gpu_pct']:.0f} GPU, zirve {pci.fmt_mb_tr(top_g['max_vram_mb'])} VRAM)"
+            )
+
+        # 6) Olaylar Sekmesi
+        self._fill_events()
+
+    def _fill_events(self):
+        if self._act_store is None:
+            return
+        machine = self._machine()
+        days = self._period_days()
+        kind = self.evt_kind_combo.currentData() if hasattr(self, "evt_kind_combo") else "tumu"
+        q = self.evt_search.text().strip() if hasattr(self, "evt_search") else ""
+        names = self._names()
+        I = self._item
+        evts = self._act_store.list_events(machine=machine, days=days if days else 3650, kind=kind, search=q, limit=400)
+        rows = []
+        for e in evts:
+            badge = self._EVT_BADGES.get(e["kind"], e["kind"])
+            rows.append([
+                I(_date(e["ts"]), e["ts"], align_right=False),
+                I(names.get(e["machine_id"], e["machine_id"]), e["machine_id"], align_right=False),
+                I(badge, badge, align_right=False),
+                I(e["title"], e["title"], align_right=False),
+                I(e["detail"] or "", e["detail"] or "", align_right=False),
+            ])
+        self._fill_table(self.evt_tbl, rows, (0, Qt.SortOrder.DescendingOrder))
+
+    def _export_markdown(self):
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        if self._act_store is None or self._pci is None:
+            return
+        default = os.path.join(os.path.expanduser("~"), time.strftime("pc-aktivite-raporu-%Y-%m-%d.md"))
+        path, _ = QFileDialog.getSaveFileName(self, "Özet Raporunu Kaydet (.md)", default, "Markdown (*.md)")
+        if path:
+            md = self._pci.SummaryEngine.to_markdown(self._act_store, machine=self._machine(), days=self._period_days())
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(md)
+            QMessageBox.information(self, "Rapor Kaydedildi", f"Özet raporu kaydedildi:\n{path}")
+
+    def closeEvent(self, event):
+        if self._act_store is not None:
+            try:
+                self._act_store.close()
+            except Exception:
+                pass
+            self._act_store = None
+        super().closeEvent(event)
 
 
 # =============================================================================
@@ -4358,10 +4722,11 @@ class HudWindow(QWidget):
     DOTS_RECT = QRectF(4, 4, 24, 24)        # sol üstteki küçük ayarlar çarkı menü butonu
     UPDATE_RECT = QRectF(8, 738, 374, 26)  # güncelleme varsa alt bilgi satırı tıklanabilir alan
 
-    def __init__(self, store=None, store_error=None, mode="panel"):
+    def __init__(self, store=None, store_error=None, mode="panel", daemon_managed=False):
         super().__init__()
         self.store = store
         self.mode = mode
+        self.daemon_managed = daemon_managed
         self.sync = None
         self.tray = None
         self.history_win = None
@@ -4414,7 +4779,8 @@ class HudWindow(QWidget):
             "size": self.settings.value("overlay_size", 20, type=int),
         }
         self.setWindowOpacity(1.0)
-        self._setup_tray()
+        if not self.daemon_managed:
+            self._setup_tray()
 
         self.setWindowTitle("Canlı Oyun & Donanım İzleyici")
         self._apply_window_flags()
@@ -4553,8 +4919,8 @@ class HudWindow(QWidget):
         self.save_settings()
 
     def _apply_window_flags(self):
-        # Sistem tepsisi varsa Tool bayrağı ile görev çubuğundan ve Alt+Tab'dan gizle (sadece tray'de görünür)
-        base = Qt.WindowType.Tool if self.tray is not None else Qt.WindowType.Window
+        # Sistem tepsisi varsa veya daemon yönetiyorsa Tool bayrağı ile görev çubuğundan ve Alt+Tab'dan gizle
+        base = Qt.WindowType.Tool if (self.tray is not None or self.daemon_managed or IS_WIN) else Qt.WindowType.Window
         flags = base | Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -4640,6 +5006,16 @@ class HudWindow(QWidget):
             self.raise_()
 
     def _on_tick(self):
+        if self.daemon_managed:
+            stop_flag = os.path.join(DATA_DIR, ".hud_stop")
+            if os.path.exists(stop_flag):
+                try:
+                    os.remove(stop_flag)
+                except OSError:
+                    pass
+                self.shutdown()
+                QApplication.instance().quit()
+                return
         t = self.telemetry
         if t.gpu.nv is not None:
             t.gpu.nv.wanted = self.isVisible() or t.capturing()
@@ -5743,11 +6119,44 @@ def run_diagnostics():
     t.stop()
 
 
+def _run_dashboard_only():
+    """--dashboard: Yalnızca PC Aktivite / Özet / Oyun Geçmişi penceresini açar.
+    Kapatılınca süreç sonlanır ve PySide6 belleği tamamen işletim sistemine iade edilir."""
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+    cfg = load_machine_config()
+    os.makedirs(MANGOHUD_DIR, exist_ok=True)
+    store = SessionStore(cfg["kimlik"])
+    # Hafif makine bilgisi (LHM/PresentMon başlatmaz!)
+    m_info = {"name": cfg.get("ad") or cfg["kimlik"], "os": _os_name()}
+    for m in store.machines():
+        if m["machine_id"] == cfg["kimlik"]:
+            m_info.update({k: v for k, v in m.items() if v is not None})
+            break
+    sync = SyncManager(store, cfg, m_info)
+    settings = QSettings("oyun-izleyici", "panel")
+    theme = settings.value("theme", "klasik", type=str)
+    accent = settings.value("accent_color", "#40ff70", type=str) or "#40ff70"
+    default_tab = "compare" if "--compare" in sys.argv else "summary"
+    win = HistoryWindow(store, sync, theme=theme, accent_hex=accent, default_tab=default_tab)
+    sync_tmr = QTimer(win)
+    sync_tmr.timeout.connect(lambda: win.refresh() if sync.tick() else None)
+    sync_tmr.start(500)
+    win.show()
+    if "--sync" in sys.argv:
+        QTimer.singleShot(150, win._open_sync_setup)
+    sys.exit(app.exec())
+
+
 def main():
     if "--tani" in sys.argv:
         run_diagnostics()
         return
+    if "--dashboard" in sys.argv or "--rapor" in sys.argv:
+        _run_dashboard_only()
+        return
     snapshot = "--snapshot" in sys.argv
+    daemon_hud = "--hud" in sys.argv
     lock = None
     if not snapshot:
         lock = acquire_single_instance(15.0 if os.environ.get("OI_RESTART") else 0.0)
@@ -5768,9 +6177,9 @@ def main():
     mode = cfg.get("mod", "otomatik")
     if mode not in ("panel", "tepsi"):
         mode = "panel" if len(QGuiApplication.screens()) >= 2 else "tepsi"
-    if snapshot:
+    if snapshot or daemon_hud:
         mode = "panel"
-    win = HudWindow(store, store_error, mode)
+    win = HudWindow(store, store_error, mode, daemon_managed=daemon_hud)
     if mode == "panel" or win.tray is None:
         win.show()
     if not snapshot:
