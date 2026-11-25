@@ -125,6 +125,15 @@ Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" 
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 700
 Move-Item $tmpProg $AppFile -Force
+$DaemonFile = Join-Path $AppDir "pc_izleyici.py"
+$localDaemon = Join-Path $Here "program\pc_izleyici.py"
+if (Test-Path $localDaemon) {
+    Copy-Item $localDaemon $DaemonFile -Force
+} else {
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$RepoSlug/main/program/pc_izleyici.py" -OutFile $DaemonFile
+    } catch { Warn "pc_izleyici.py indirilemedi (normal modda calisacak): $_" }
+}
 
 # ---- 4. PresentMon -------------------------------------------------------------
 $needPm = $true
