@@ -18,7 +18,7 @@ import time
 import math
 from collections import deque
 
-APP_VERSION = "4.0.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.1.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
