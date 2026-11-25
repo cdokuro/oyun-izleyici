@@ -2739,6 +2739,23 @@ class PCActivityDaemon:
             )
 
     def run(self):
+        # Linux'ta ilk açılış/güncellemede eksik bağımlılık (psutil/kdotool/xdotool) varsa kullanıcıya sor
+        if not IS_WIN and self.cfg.get("linux_deps_sor", "acik") != "kapali":
+            desk = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+            need_win_tool = (
+                not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+                and (
+                    (bool(os.environ.get("WAYLAND_DISPLAY")) and "kde" in desk and not shutil.which("kdotool"))
+                    or (not (bool(os.environ.get("WAYLAND_DISPLAY")) and "kde" in desk) and not shutil.which("xdotool"))
+                )
+            )
+            if psutil is None or need_win_tool:
+                if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+                    try:
+                        subprocess.Popen([self._python_exe(), self.app_script, "--deps-check"], close_fds=True)
+                    except Exception:
+                        pass
+
         # İlk açılışta HUD hep açık seçiliyse başlat
         if self.cfg.get("hud_hep_acik", "kapali") == "acik":
             self.ensure_hud_running(auto=False)
