@@ -35,7 +35,7 @@ else:
 # UI bayrağı (--hud / --dashboard / --tani / --snapshot / --eski) yoksa
 # ~20 MB RAM ile 7/24 çalışan pc_izleyici arka plan servisini başlatır.
 # =============================================================================
-_UI_FLAGS = {"--hud", "--dashboard", "--rapor", "--sync", "--tani", "--snapshot", "--eski", "--auto-hud"}
+_UI_FLAGS = {"--hud", "--dashboard", "--rapor", "--sync", "--tani", "--snapshot", "--eski", "--auto-hud", "--deps-check"}
 if __name__ == "__main__" and not (set(sys.argv[1:]) & _UI_FLAGS):
     _app_dir = os.path.dirname(os.path.abspath(__file__))
     _daemon_local = os.path.join(_app_dir, "pc_izleyici.py")
@@ -6145,6 +6145,186 @@ def run_diagnostics():
     t.stop()
 
 
+def detect_linux_missing_deps():
+    """Linux'ta eksik bağımlılıkları ve dağıtıma uygun kurulum komutlarını döndürür."""
+    if IS_WIN:
+        return [], []
+    import shutil
+    missing = []  # list of (ad, aciklama, paket_turu)
+    try:
+        import psutil  # noqa: F401
+    except ImportError:
+        missing.append(("psutil", "Uygulama bazlı RAM, CPU ve GPU/VRAM tüketimi takibi", "psutil"))
+
+    desk = (os.environ.get("XDG_CURRENT_DESKTOP") or "").lower()
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+    is_hypr = bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+    if not is_hypr:
+        if is_wayland and "kde" in desk:
+            if not shutil.which("kdotool"):
+                missing.append(("kdotool", "KDE Wayland'da aktif uygulama ve tarayıcı sekmesi takibi", "kdotool"))
+        elif not shutil.which("xdotool"):
+            missing.append(("xdotool", "Aktif pencere ve tarayıcı sekmesi süre takibi", "xdotool"))
+
+    if not missing:
+        return [], []
+
+    cmds = []
+    kinds = {m[2] for m in missing}
+    if shutil.which("pacman"):
+        pac_pkgs = []
+        if "psutil" in kinds:
+            pac_pkgs.append("python-psutil")
+        if "xdotool" in kinds:
+            pac_pkgs.append("xdotool")
+        if pac_pkgs:
+            cmds.append(f"sudo pacman -S --needed {' '.join(pac_pkgs)}")
+        if "kdotool" in kinds:
+            aur = "paru" if shutil.which("paru") else ("yay" if shutil.which("yay") else None)
+            if aur:
+                cmds.append(f"{aur} -S --needed kdotool")
+            else:
+                cmds.append("yay -S --needed kdotool  # veya AUR'dan kdotool")
+    elif shutil.which("apt"):
+        apt_pkgs = []
+        if "psutil" in kinds:
+            apt_pkgs.append("python3-psutil")
+        if "xdotool" in kinds:
+            apt_pkgs.append("xdotool")
+        if apt_pkgs:
+            cmds.append(f"sudo apt update && sudo apt install -y {' '.join(apt_pkgs)}")
+        if "kdotool" in kinds:
+            cmds.append("cargo install kdotool  # KDE Wayland pencere takibi için")
+    elif shutil.which("dnf"):
+        dnf_pkgs = []
+        if "psutil" in kinds:
+            dnf_pkgs.append("python3-psutil")
+        if "xdotool" in kinds:
+            dnf_pkgs.append("xdotool")
+        if dnf_pkgs:
+            cmds.append(f"sudo dnf install -y {' '.join(dnf_pkgs)}")
+        if "kdotool" in kinds:
+            cmds.append("cargo install kdotool  # KDE Wayland pencere takibi için")
+    else:
+        if "psutil" in kinds:
+            cmds.append("pip install --user psutil")
+    return missing, cmds
+
+
+def prompt_linux_deps(parent=None, theme="klasik", accent_hex="#40ff70", force=False):
+    """Eksik Linux bağımlılığı varsa kullanıcıya sorar; Evet derse kopyalanabilir komutları
+    ve tek tıkla terminalde çalıştırma seçeneğini sunar."""
+    if IS_WIN:
+        return
+    cfg = load_machine_config()
+    if not force and cfg.get("linux_deps_sor", "acik") == "kapali":
+        return
+    missing, cmds = detect_linux_missing_deps()
+    if not missing:
+        return
+
+    import shutil
+    import subprocess
+    from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+                                   QPlainTextEdit, QMessageBox)
+
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Oyun & PC İzleyici — Eksik Linux Bağımlılıkları")
+    dlg.setMinimumWidth(560)
+    dlg.setStyleSheet(build_history_style(theme, accent_hex))
+    v = QVBoxLayout(dlg)
+    v.setContentsMargins(18, 16, 18, 14)
+    v.setSpacing(10)
+
+    hdr = QLabel("🧩 Yeni Özellikler İçin Eksik Bağımlılıklar Bulundu")
+    hdr.setObjectName("title")
+    v.addWidget(hdr)
+
+    items_html = "<br>".join(f"• <b>{n}</b> — {desc}" for n, desc, _ in missing)
+    intro = QLabel(
+        f"PC aktivite, web sitesi ve RAM/GPU takibinin bu Linux sisteminde tam çalışması için "
+        f"aşağıdaki paketler eksik:<br><br>{items_html}<br><br>"
+        f"<b>Bu bağımlılıklar için kurulum komutlarını göstereyim mi?</b>"
+    )
+    intro.setObjectName("gameSummary")
+    intro.setWordWrap(True)
+    intro.setTextFormat(Qt.TextFormat.RichText)
+    v.addWidget(intro)
+
+    cmd_text = "\n".join(cmds)
+    cmd_box = QPlainTextEdit(cmd_text)
+    cmd_box.setReadOnly(True)
+    cmd_box.setMaximumHeight(92)
+    cmd_box.setVisible(False)
+    v.addWidget(cmd_box)
+
+    action_row = QHBoxLayout()
+    b_copy = QPushButton("📋 Komutu Kopyala")
+    b_copy.setVisible(False)
+    b_term = QPushButton("🖥️ Terminalde Aç ve Çalıştır")
+    b_term.setObjectName("primary")
+    b_term.setVisible(False)
+    action_row.addWidget(b_copy)
+    action_row.addWidget(b_term)
+    action_row.addStretch(1)
+    v.addLayout(action_row)
+
+    def _copy_cmd():
+        QGuiApplication.clipboard().setText(cmd_text)
+        b_copy.setText("✓ Kopyalandı!")
+
+    def _open_terminal():
+        full_cmd = " && ".join(cmds) + '; echo ""; echo "Tamamlandı. Kapatmak için Enter\'a bas..."; read'
+        for term, args in (
+            ("konsole", ["-e", "bash", "-lc", full_cmd]),
+            ("kitty", ["bash", "-lc", full_cmd]),
+            ("alacritty", ["-e", "bash", "-lc", full_cmd]),
+            ("gnome-terminal", ["--", "bash", "-lc", full_cmd]),
+            ("xfce4-terminal", ["-e", f"bash -lc {full_cmd!r}"]),
+            ("xterm", ["-e", "bash", "-lc", full_cmd]),
+        ):
+            if shutil.which(term):
+                subprocess.Popen([term, *args], start_new_session=True)
+                dlg.accept()
+                return
+        _copy_cmd()
+        QMessageBox.information(dlg, "Terminal Bulunamadı",
+                                "Komut panoya kopyalandı; kendi terminaline yapıştırıp çalıştırabilirsin.")
+
+    b_copy.clicked.connect(_copy_cmd)
+    b_term.clicked.connect(_open_terminal)
+
+    btn_row = QHBoxLayout()
+    b_yes = QPushButton("✅ Evet, Komutları Göster")
+    b_yes.setObjectName("primary")
+    b_later = QPushButton("Sonra Hatırlat")
+    b_never = QPushButton("Bir Daha Sorma")
+
+    def _reveal():
+        cmd_box.setVisible(True)
+        b_copy.setVisible(True)
+        b_term.setVisible(True)
+        b_yes.setVisible(False)
+        QGuiApplication.clipboard().setText(cmd_text)
+        b_copy.setText("✓ Panoya Kopyalandı (Tekrar Kopyala)")
+        dlg.adjustSize()
+
+    def _never():
+        save_machine_config({"linux_deps_sor": "kapali"})
+        dlg.reject()
+
+    b_yes.clicked.connect(_reveal)
+    b_later.clicked.connect(dlg.reject)
+    b_never.clicked.connect(_never)
+
+    btn_row.addWidget(b_yes)
+    btn_row.addStretch(1)
+    btn_row.addWidget(b_later)
+    btn_row.addWidget(b_never)
+    v.addLayout(btn_row)
+    dlg.exec()
+
+
 def _run_dashboard_only():
     """--dashboard: Yalnızca PC Aktivite / Özet / Oyun Geçmişi penceresini açar.
     Kapatılınca süreç sonlanır ve PySide6 belleği tamamen işletim sistemine iade edilir."""
@@ -6171,12 +6351,23 @@ def _run_dashboard_only():
     win.show()
     if "--sync" in sys.argv:
         QTimer.singleShot(150, win._open_sync_setup)
+    elif not IS_WIN:
+        QTimer.singleShot(400, lambda: prompt_linux_deps(win, theme=theme, accent_hex=accent))
     sys.exit(app.exec())
 
 
 def main():
     if "--tani" in sys.argv:
         run_diagnostics()
+        return
+    if "--deps-check" in sys.argv:
+        app = QApplication(sys.argv)
+        settings = QSettings("oyun-izleyici", "panel")
+        prompt_linux_deps(
+            None,
+            theme=settings.value("theme", "klasik", type=str),
+            accent_hex=settings.value("accent_color", "#40ff70", type=str) or "#40ff70",
+        )
         return
     if "--dashboard" in sys.argv or "--rapor" in sys.argv:
         _run_dashboard_only()
