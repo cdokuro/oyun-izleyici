@@ -66,6 +66,7 @@ MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "github.token")
 KOMUTA_KEY_PATH = os.path.join(CONFIG_DIR, "komuta.key")
 HUD_STOP_FLAG = os.path.join(DATA_DIR, ".hud_stop")
+NOTIFY_FILE = os.path.join(DATA_DIR, ".notify.json")
 
 IDLE_THRESHOLD_SEC = 120.0
 POLL_ACTIVE_SEC = 2.0
@@ -76,7 +77,7 @@ POLL_HEARTBEAT_SEC = 60.0
 POLL_INGEST_SEC = 300.0
 FLUSH_SEC = 30.0
 SYNC_INTERVAL_SEC = 15 * 60
-HUD_IDLE_GRACE_SEC = 45.0
+HUD_IDLE_GRACE_SEC = 95.0
 SYNC_ACTIVITY_DAYS = 90
 SYNC_MAX_EVENTS = 1500
 
@@ -2913,12 +2914,34 @@ class PCActivityDaemon:
                 continue
         return False
 
+    def _check_pending_notify(self):
+        """HUD (--hud) sürecinden gelen oyun sonu / sıcaklık bildirimlerini Win32 tepsisinden gösterir."""
+        if not os.path.isfile(NOTIFY_FILE):
+            return
+        try:
+            with open(NOTIFY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            os.remove(NOTIFY_FILE)
+            title = (data.get("title") or "Oyun İzleyici").strip()
+            body = (data.get("body") or "").strip()
+            if self.tray and body:
+                self.tray.balloon(title, body)
+            # Oyun bittiğinde güncel oturumu ve veriyi beklemeden senkronla
+            self.sync.maybe_sync(force=True)
+            self.komuta.send_ingest()
+        except Exception:
+            try:
+                os.remove(NOTIFY_FILE)
+            except OSError:
+                pass
+
     def step(self):
         now = time.time()
         if now >= self._next_poll:
             self._next_poll = now + POLL_ACTIVE_SEC
             self._poll_active(now)
             self._check_auto_hud(now)
+            self._check_pending_notify()
 
         if now >= self._next_browser:
             self._next_browser = now + POLL_BROWSER_SEC
