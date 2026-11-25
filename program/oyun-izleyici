@@ -2215,6 +2215,12 @@ WIN_IGNORED_EXES = {
     "python.exe", "pythonw.exe", "presentmon.exe", "msiafterburner.exe", "rtss.exe", "nvcontainer.exe",
     "powershell.exe", "pwsh.exe", "windowsterminal.exe", "cmd.exe", "antigravity.exe", "opencode.exe",
     "gcc.exe", "artcraft-launcher.exe", "anydesk.exe", "rustdesk.exe",
+    # Electron / overlay / sürücü / çözülemeyen sistem süreçleri (asla oyun sayılmaz)
+    "electron.exe", "claude.exe", "amdrsserv.exe", "amdow.exe", "cncmd.exe", "rsservcmd.exe",
+    "nvdisplay.container.exe", "nvidia overlay.exe", "nvidia share.exe", "gameoverlayui.exe",
+    "xboxgamebar.exe", "gamebar.exe", "gamebarftserver.exe", "snippingtool.exe", "screenclippinghost.exe",
+    "wallpaper32.exe", "wallpaper64.exe", "csrss.exe", "winlogon.exe", "fontdrvhost.exe",
+    "sihost.exe", "ctfmon.exe", "searchui.exe", "<unknown>", "unknown", "_unknown_",
 }
 
 
@@ -2316,7 +2322,8 @@ class WinFrameCapture:
         args = [self.exe, "--session_name", self.SESSION_NAME, "--stop_existing_session",
                 "--output_stdout", "--no_console_stats", "--v2_metrics"]
         for n in ("dwm.exe", "explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe", "zen.exe", "radeonsoftware.exe",
-                  "python.exe", "pythonw.exe", "steamwebhelper.exe", "discord.exe"):
+                  "amdrsserv.exe", "amdow.exe", "electron.exe", "antigravity.exe", "opencode.exe",
+                  "python.exe", "pythonw.exe", "steamwebhelper.exe", "discord.exe", "gameoverlayui.exe", "gamebar.exe"):
             args += ["--exclude", n]
         errlog = open(os.path.join(self.out_dir, "presentmon.log"), "w", encoding="utf-8")
         return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errlog, text=True, bufsize=1,
@@ -2331,7 +2338,7 @@ class WinFrameCapture:
         idx = {
             "app": low.index("application"), "pid": low.index("processid"),
             "ft": None, "ts": None, "ts_ms": False, "gpu_busy": None, "cpu_busy": None,
-            "disp_lat": None, "pmode": None,
+            "disp_lat": None, "pmode": None, "dropped": None,
         }
         for key, cands in (
             ("ft", ("frametime", "msbetweenpresents")),
@@ -2340,6 +2347,7 @@ class WinFrameCapture:
             ("cpu_busy", ("cpubusy", "msinpresentapi")),
             ("disp_lat", ("displaylatency", "msuntildisplayed")),
             ("pmode", ("presentmode",)),
+            ("dropped", ("dropped", "isdropped")),
         ):
             for n in cands:
                 if n in low:
@@ -2392,13 +2400,83 @@ class WinFrameCapture:
             wait = 5 if time.monotonic() - started > 30 else min(60, wait * 2)
             time.sleep(wait)
 
+    @staticmethod
+    def _is_placeholder_app(name):
+        n = (name or "").strip().lower()
+        return (not n) or n in ("<unknown>", "unknown", "_unknown_", "<error>", "system", "idle", "registry")
+
+    @staticmethod
+    def _query_pid_exe_name(pid):
+        """Resolve real .exe basename from PID (Win32 QueryFullProcessImageNameW -> psutil fallback)."""
+        if not pid or pid <= 4:
+            return ""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+            k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if h:
+                try:
+                    buf = ctypes.create_unicode_buffer(512)
+                    sz = wintypes.DWORD(512)
+                    if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(sz)) and buf.value:
+                        return os.path.basename(buf.value)
+                finally:
+                    k32.CloseHandle(h)
+        except Exception:
+            pass
+        ps = _win_psutil()
+        if ps:
+            try:
+                nm = ps.Process(int(pid)).name()
+                if nm:
+                    return nm
+            except Exception:
+                pass
+        return ""
+
+    def _resolve_pid_name(self, pid, raw_app):
+        """Return valid exe name for pid; resolve via OS if PresentMon emitted <unknown>."""
+        if not self._is_placeholder_app(raw_app):
+            return raw_app
+        cached = self._names.get(pid)
+        if cached and not self._is_placeholder_app(cached):
+            return cached
+        resolved = self._query_pid_exe_name(pid)
+        return resolved if not self._is_placeholder_app(resolved) else ""
+
+    @staticmethod
+    def _pid_rss_mb(pid):
+        ps = _win_psutil()
+        if not ps:
+            return 0.0
+        try:
+            return ps.Process(int(pid)).memory_info().rss / (1024 * 1024)
+        except Exception:
+            return 0.0
+
     def on_row(self, parts, idx):
         """PresentMon'dan gelen tek bir sunulan kare satırı (test edilebilsin diye ayrı)."""
         from collections import deque
         try:
             pid = int(parts[idx["pid"]])
-            app = parts[idx["app"]].strip()
+            raw_app = parts[idx["app"]].strip()
         except (ValueError, IndexError):
+            return
+        if pid <= 4:
+            return
+        # Düşürülmüş (ekrana çıkmamış) kareleri sayma (sahte FPS sıçramasını önler)
+        if idx.get("dropped") is not None and idx["dropped"] < len(parts):
+            if parts[idx["dropped"]].strip().lower() in ("1", "true"):
+                return
+        app = self._resolve_pid_name(pid, raw_app)
+        if not app or app.lower() in self.ignore:
             return
         now = time.monotonic()
         ft = None
@@ -2417,7 +2495,7 @@ class WinFrameCapture:
                     ft = (frame_ts - prev) * 1000.0
         except (ValueError, IndexError):
             return
-        if ft is None or not (0.05 <= ft <= 5000.0):
+        if ft is None or not (0.8 <= ft <= 5000.0):
             return
         def _opt_float(key):
             i = idx.get(key)
@@ -2481,19 +2559,26 @@ class WinFrameCapture:
         fg = windows_foreground_pid()
         best = None
         for pid, dq in self._frames.items():
-            if pid == exclude or pid == os.getpid():
+            if pid == exclude or pid == os.getpid() or pid <= 4:
                 continue
-            if self._names.get(pid, "").lower() in self.ignore or not self._pid_alive(pid):
+            nm = self._names.get(pid, "")
+            if self._is_placeholder_app(nm) or nm.lower() in self.ignore or not self._pid_alive(pid):
                 continue
             n = sum(1 for ts, _ in dq if now - ts <= self.WINDOW_SEC)
             if n < self.START_FPS * self.WINDOW_SEC:
                 self._qual_since.pop(pid, None)
                 continue
             since = self._qual_since.setdefault(pid, now)
-            if pid != fg and now - since < self.BG_START_SEC:
-                continue
-            if best is None or n > best[0]:
-                best = (n, pid)
+            is_fg = (pid == fg)
+            if not is_fg:
+                if now - since < self.BG_START_SEC:
+                    continue
+                # Arka plandaki küçük araç/katman süreçleri oyunu devralmasın
+                if self._pid_rss_mb(pid) < 120.0:
+                    continue
+            score = (1 if is_fg else 0, n)
+            if best is None or score > best[0]:
+                best = (score, pid)
         return best[1] if best else None
 
     def tick(self, now):
@@ -2579,9 +2664,13 @@ class WinFrameCapture:
         lines = []
         last_ft = act["last_ft"]
         for fts in bins:
-            ft = sum(fts) / len(fts)
+            if len(fts) >= 4:
+                s_fts = sorted(fts)[1:-1]  # tek karelik uç sapmaları (glitch) kırp
+                ft = sum(s_fts) / len(s_fts)
+            else:
+                ft = sum(fts) / len(fts)
             last_ft = ft
-            fps = min(2000.0, max(1.0, 1000.0 / ft))
+            fps = min(1000.0, max(1.0, 1000.0 / ft))
             row = [f"{fps:.3f}", f"{ft:.3f}", v(getattr(t, "cpu_load", 0)), v(getattr(t, "cpu_watt", 0)),
                    v(getattr(t, "gpu_load", 0)), v(getattr(t, "cpu_temp", 0)), v(getattr(t, "gpu_temp", 0)),
                    v(getattr(t, "gpu_mhz", 0)), 0, f"{v(getattr(t, 'vram_used_mb', 0)) / 1024.0:.3f}",
