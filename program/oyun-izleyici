@@ -71,6 +71,7 @@ DATA_DIR = (os.path.join(_LOCAL, "oyun-izleyici") if IS_WIN
 INSTALLED_BIN = (os.path.join(DATA_DIR, "app", "oyun_izleyici.pyw") if IS_WIN
                  else os.path.join(os.path.expanduser("~"), ".local", "bin", "oyun-izleyici"))
 PRESENTMON_EXE = os.path.join(DATA_DIR, "bin", "PresentMon.exe")
+LHM_DLL = os.path.join(DATA_DIR, "lhm", "LibreHardwareMonitorLib.dll")
 DB_PATH = os.path.join(DATA_DIR, "oyunlar.db")
 BACKUP_DIR = os.path.join(DATA_DIR, "yedekler")
 BACKUP_KEEP = 60               # son 60 yedek tutulur (günlük + elle alınanlar)
@@ -692,9 +693,134 @@ class SessionStore:
 
 # =============================================================================
 # GITHUB SENKRONU — her PC sadece makineler/<kimlik>/ klasörüne yazar (çakışma olmaz)
+# Git/SSH deposu VEYA GitHub Token (REST API, git gerektirmez) desteklenir.
 # =============================================================================
+CONFIG_DIR = (os.path.join(_ROAM, "oyun-izleyici") if IS_WIN
+              else os.path.join(os.path.expanduser("~"), ".config", "oyun-izleyici"))
+MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
+TOKEN_PATH = os.path.join(CONFIG_DIR, "github.token")
 REPO_DIR = os.path.join(DATA_DIR, "depo")
 SYNC_INTERVAL_SEC = 15 * 60
+
+
+def normalize_repo_slug(raw):
+    """'https://github.com/sahip/depo.git', 'git@github.com:sahip/depo' veya 'sahip/depo' -> 'sahip/depo'."""
+    s = (raw or "").strip()
+    for pref in ("https://github.com/", "http://github.com/", "github.com/", "git@github.com:"):
+        if s.lower().startswith(pref):
+            s = s[len(pref):]
+            break
+    if s.lower().endswith(".git"):
+        s = s[:-4]
+    parts = [p for p in s.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return ""
+    slug = f"{parts[0]}/{parts[1]}"
+    return slug if re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", slug) else ""
+
+
+def find_git_exe():
+    """PATH veya standart Windows kurulum yollarındaki git ikilisini bulur."""
+    g = shutil_which("git")
+    if g:
+        return g
+    if IS_WIN:
+        cands = [
+            os.path.join(_LOCAL, "Programs", "Git", "cmd", "git.exe"),
+            r"C:\Program Files\Git\cmd\git.exe",
+            r"C:\Program Files (x86)\Git\cmd\git.exe",
+        ]
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+    return None
+
+
+def ssh_key_path():
+    return os.path.join(os.path.expanduser("~"), ".ssh", "oyun_kayitlari_ed25519")
+
+
+def ensure_ssh_key():
+    """Deploy key için ed25519 anahtar çifti oluşturur (varsa korur) ve (priv_path, pub_text) döndürür."""
+    import socket
+    import subprocess
+    key = ssh_key_path()
+    pub = key + ".pub"
+    if not (os.path.isfile(key) and os.path.isfile(pub)):
+        os.makedirs(os.path.dirname(key), exist_ok=True)
+        keygen = (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "OpenSSH", "ssh-keygen.exe")
+                  if IS_WIN else shutil_which("ssh-keygen"))
+        if not keygen or not os.path.isfile(keygen):
+            keygen = shutil_which("ssh-keygen")
+        if not keygen:
+            raise RuntimeError("ssh-keygen bulunamadı (OpenSSH kurulu değil).")
+        p = subprocess.run([keygen, "-q", "-t", "ed25519", "-N", "",
+                            "-C", f"oyun-izleyici@{socket.gethostname()}", "-f", key],
+                           capture_output=True, text=True, timeout=20, **_hidden())
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout or "ssh-keygen başarısız").strip())
+    with open(pub, encoding="utf-8") as f:
+        return key, f.read().strip()
+
+
+def read_github_token():
+    try:
+        with open(TOKEN_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def write_github_token(token):
+    token = (token or "").strip()
+    if not token:
+        try:
+            os.remove(TOKEN_PATH)
+        except OSError:
+            pass
+        return
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = TOKEN_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(token + "\n")
+    if not IS_WIN:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    os.replace(tmp, TOKEN_PATH)
+
+
+def github_api_request(method, url, token=None, body=None, timeout=20):
+    import json
+    import urllib.error
+    import urllib.request
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "oyun-izleyici",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+            err_msg = json.loads(raw).get("message") or raw
+        except Exception:
+            err_msg = raw or str(e)
+        raise RuntimeError(f"GitHub HTTP {e.code}: {err_msg}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Bağlantı hatası: {e.reason}") from None
 
 
 def _os_name():
@@ -717,8 +843,11 @@ class SyncManager:
         self.cfg = cfg
         self.mid = cfg["kimlik"]
         self.info = machine_info
-        self.enabled = cfg.get("senkron", "acik") != "kapali" and os.path.isdir(os.path.join(REPO_DIR, ".git"))
-        self.state = "kapalı" if not self.enabled else "bekliyor"
+        self.mode = None          # "git" | "api" | None
+        self.repo_slug = ""
+        self.token = ""
+        self.enabled = False
+        self.state = "kapalı"
         self.last_ok = None
         self.last_error = None
         self.update_available = False
@@ -727,7 +856,62 @@ class SyncManager:
         self._result = None
         self._again = False
         self.next_at = time.time() + 10  # açılıştan 10 sn sonra ilk senkron
+        self._reload_mode()
         self.check_app_update()
+
+    def _reload_mode(self):
+        self.repo_slug = normalize_repo_slug(self.cfg.get("kayit_deposu", ""))
+        self.token = read_github_token()
+        if self.cfg.get("senkron", "acik") == "kapali":
+            self.mode, self.enabled, self.state = None, False, "kapalı"
+            return
+        if os.path.isdir(os.path.join(REPO_DIR, ".git")) and find_git_exe():
+            self.mode, self.enabled, self.state = "git", True, "bekliyor"
+        elif self.repo_slug:
+            self.mode, self.enabled, self.state = "api", True, "bekliyor"
+        else:
+            self.mode, self.enabled, self.state = None, False, "kapalı"
+
+    def configure_api(self, repo_slug, token):
+        slug = normalize_repo_slug(repo_slug)
+        if not slug:
+            raise ValueError("Geçerli bir depo adı gir (ör. kullanici/oyun-kayitlari).")
+        write_github_token(token)
+        save_machine_config({"kayit_deposu": slug, "senkron": "acik"})
+        self.cfg["kayit_deposu"] = slug
+        self.cfg["senkron"] = "acik"
+        self.repo_slug = slug
+        self.token = (token or "").strip()
+        self.mode = "api"
+        self.enabled = True
+        self.last_error = None
+        self.state = "bekliyor"
+        self.request()
+
+    def configure_git(self, repo_slug=""):
+        slug = normalize_repo_slug(repo_slug)
+        updates = {"senkron": "acik"}
+        if slug:
+            updates["kayit_deposu"] = slug
+            self.cfg["kayit_deposu"] = slug
+        save_machine_config(updates)
+        self.cfg["senkron"] = "acik"
+        self._reload_mode()
+        self.last_error = None
+        if self.enabled:
+            self.request()
+
+    def disconnect(self):
+        save_machine_config({"kayit_deposu": "", "senkron": "kapali"})
+        write_github_token("")
+        self.cfg["kayit_deposu"] = ""
+        self.cfg["senkron"] = "kapali"
+        self.repo_slug = ""
+        self.token = ""
+        self.mode = None
+        self.enabled = False
+        self.last_error = None
+        self.state = "kapalı"
 
     def check_app_update(self):
         """Depodaki program/oyun-izleyici ile kurulu ~/.local/bin/oyun-izleyici farklı mı kontrol eder."""
@@ -794,7 +978,8 @@ class SyncManager:
             self.last_error, self.state = f"dosya hatası: {e}", "hata"
             return
         self.state = "senkronize ediliyor"
-        self._thread = threading.Thread(target=self._git_worker, daemon=True)
+        worker = self._git_worker if self.mode == "git" else self._api_worker
+        self._thread = threading.Thread(target=worker, daemon=True)
         self._thread.start()
 
     def _own_dir(self):
@@ -803,13 +988,14 @@ class SyncManager:
     @staticmethod
     def _write_if_changed(path, text):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8", newline="") as f:
                 if f.read() == text:
                     return False
         except OSError:
             pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         os.replace(tmp, path)
         return True
@@ -863,13 +1049,14 @@ class SyncManager:
                 self.store.replace_machine_sessions(mid, rows)
         self.store.upsert_machine(self.mid, dict(self.info, name=self.cfg.get("ad") or self.mid))
 
-    # --- arka plan (sadece git) ---
+    # --- arka plan (git/SSH) ---
     def _git(self, *args, timeout=90):
         import subprocess
+        git_exe = find_git_exe() or "git"
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
         if not IS_WIN:
             env.update(GIT_ASKPASS="true", SSH_ASKPASS="true")
-        p = subprocess.run(["git", "-C", REPO_DIR, *args], capture_output=True, text=True,
+        p = subprocess.run([git_exe, "-C", REPO_DIR, *args], capture_output=True, text=True,
                            timeout=timeout, env=env, **_hidden())
         if p.returncode != 0:
             raise RuntimeError((p.stderr or p.stdout).strip().splitlines()[-1] if (p.stderr or p.stdout).strip()
@@ -892,17 +1079,120 @@ class SyncManager:
         except Exception as e:
             self._result = (False, str(e))
 
+    # --- arka plan (GitHub Token / REST API — git gerektirmez) ---
+    def _api_read_file(self, slug, rel_path, branch, token):
+        import base64
+        import urllib.parse
+        q = urllib.parse.quote(rel_path, safe="/")
+        url = f"https://api.github.com/repos/{slug}/contents/{q}?ref={urllib.parse.quote(branch)}"
+        _, data = github_api_request("GET", url, token=token)
+        if not isinstance(data, dict):
+            return None, None
+        sha = data.get("sha")
+        if data.get("encoding") == "base64" and data.get("content") is not None:
+            raw = base64.b64decode(data["content"].encode("ascii")).decode("utf-8", errors="replace")
+            return raw, sha
+        if sha:
+            b_url = f"https://api.github.com/repos/{slug}/git/blobs/{sha}"
+            _, blob = github_api_request("GET", b_url, token=token)
+            if blob.get("encoding") == "base64" and blob.get("content") is not None:
+                raw = base64.b64decode(blob["content"].encode("ascii")).decode("utf-8", errors="replace")
+                return raw, sha
+        return None, sha
+
+    def _api_worker(self):
+        import base64
+        import urllib.parse
+        slug = self.repo_slug
+        token = self.token
+        try:
+            _, repo = github_api_request("GET", f"https://api.github.com/repos/{slug}", token=token)
+            branch = repo.get("default_branch") or "main"
+
+            # 1) Bu PC'nin kendi dosyalarını yalnızca değiştiyse GitHub'a gönder (token varsa)
+            if token:
+                own_dir = self._own_dir()
+                msg = f"{self.cfg.get('ad') or self.mid}: kayıtlar güncellendi"
+                for fname in ("makine.json", "oturumlar.jsonl"):
+                    local_path = os.path.join(own_dir, fname)
+                    if not os.path.isfile(local_path):
+                        continue
+                    with open(local_path, encoding="utf-8") as f:
+                        local_txt = f.read()
+                    rel = f"makineler/{self.mid}/{fname}"
+                    remote_txt, remote_sha = None, None
+                    try:
+                        remote_txt, remote_sha = self._api_read_file(slug, rel, branch, token)
+                    except RuntimeError as e:
+                        if "HTTP 404" not in str(e):
+                            raise
+                    if remote_txt == local_txt:
+                        continue
+                    payload = {
+                        "message": msg,
+                        "content": base64.b64encode(local_txt.encode("utf-8")).decode("ascii"),
+                        "branch": branch,
+                    }
+                    if remote_sha:
+                        payload["sha"] = remote_sha
+                    q = urllib.parse.quote(rel, safe="/")
+                    github_api_request("PUT", f"https://api.github.com/repos/{slug}/contents/{q}",
+                                       token=token, body=payload)
+
+            # 2) Depodaki tüm makineleri indir (REPO_DIR/makineler/<id>/ altına)
+            entries = []
+            try:
+                _, listing = github_api_request(
+                    "GET",
+                    f"https://api.github.com/repos/{slug}/contents/makineler?ref={urllib.parse.quote(branch)}",
+                    token=token)
+                if isinstance(listing, list):
+                    entries = [it for it in listing if it.get("type") == "dir" and it.get("name")]
+            except RuntimeError as e:
+                if "HTTP 404" not in str(e):
+                    raise
+
+            for entry in entries:
+                mid = entry["name"]
+                if mid == self.mid and token:
+                    continue
+                target_dir = os.path.join(REPO_DIR, "makineler", mid)
+                os.makedirs(target_dir, exist_ok=True)
+                for fname in ("makine.json", "oturumlar.jsonl"):
+                    try:
+                        txt, _ = self._api_read_file(slug, f"makineler/{mid}/{fname}", branch, token)
+                        if txt is not None:
+                            self._write_if_changed(os.path.join(target_dir, fname), txt)
+                    except RuntimeError as e:
+                        if "HTTP 404" not in str(e):
+                            raise
+
+            # 3) Depoda program/oyun-izleyici varsa yerel kopyasını güncelle (tek tık güncelleme rozeti için)
+            try:
+                prog_txt, _ = self._api_read_file(slug, "program/oyun-izleyici", branch, token)
+                if prog_txt is not None:
+                    self._write_if_changed(os.path.join(REPO_DIR, "program", "oyun-izleyici"), prog_txt)
+            except RuntimeError as e:
+                if "HTTP 404" not in str(e):
+                    raise
+
+            self._result = (True, None)
+        except Exception as e:
+            self._result = (False, str(e))
+
     def status_text(self):
         if not self.enabled:
-            return "GitHub senkronu kapalı (kurulmamış)"
+            return "GitHub senkronu kapalı — PC karşılaştırması için 'GitHub Deposu Bağla'ya tıkla"
+        tag = f" ({self.repo_slug})" if self.repo_slug else ""
+        ro = " [salt okunur]" if (self.mode == "api" and not self.token) else ""
         upd = "   ·   ⬆ Yeni uygulama güncellemesi hazır!" if self.update_available else ""
         if self.state == "senkronize ediliyor":
-            return "GitHub: senkronize ediliyor…" + upd
+            return f"GitHub{tag}: senkronize ediliyor…" + upd
         if self.last_error:
-            return f"GitHub: HATA — {self.last_error}" + upd
+            return f"GitHub{tag}: HATA — {self.last_error}" + upd
         if self.last_ok:
-            return "GitHub: son senkron " + time.strftime("%H:%M", time.localtime(self.last_ok)) + " ✓" + upd
-        return "GitHub: bekliyor" + upd
+            return f"GitHub{tag}{ro}: son senkron " + time.strftime("%H:%M", time.localtime(self.last_ok)) + " ✓" + upd
+        return f"GitHub{tag}{ro}: bekliyor" + upd
 
 
 def apply_app_update(parent_win=None):
@@ -943,9 +1233,6 @@ def apply_app_update(parent_win=None):
 # =============================================================================
 # MAKİNE AYARLARI (~/.config/oyun-izleyici/makine.conf) — her PC kendi dosyasını tutar
 # =============================================================================
-CONFIG_DIR = (os.path.join(_ROAM, "oyun-izleyici") if IS_WIN
-              else os.path.join(os.path.expanduser("~"), ".config", "oyun-izleyici"))
-MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
 
 
 def _slug(text):
@@ -972,6 +1259,7 @@ def load_machine_config():
         "baslik": "",            # oyun yokken panelin altında görünen yazı (boşsa OYUN İZLEYİCİ)
         "engelle": "",           # Windows: oyun sayılmayacak programlar (virgülle: foo.exe, bar.exe)
         "senkron": "acik",       # acik | kapali
+        "kayit_deposu": "",      # isteğe bağlı: GitHub kayıt deposu (sahip/depo)
     }
     changed = False
     for k, v in defaults.items():
@@ -980,14 +1268,36 @@ def load_machine_config():
             changed = True
     if changed:
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(MACHINE_CONF, "w", encoding="utf-8") as f:
+        tmp = MACHINE_CONF + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write("# Oyun İzleyici — bu PC'ye özel ayarlar\n"
                     "# kimlik: GitHub deposundaki klasör adı (değiştirme), ad: listelerde görünen isim\n"
                     "# mod: otomatik (2+ ekran = panel, tek ekran = sadece tepsi) | panel | tepsi\n")
             cp.write(f)
+        os.replace(tmp, MACHINE_CONF)
     cfg = dict(cp.items("makine"))
     cfg["kimlik"] = _slug(cfg["kimlik"])
     return cfg
+
+
+def save_machine_config(updates):
+    """makine.conf içindeki belirli anahtarları atomik olarak günceller."""
+    import configparser
+    load_machine_config()
+    cp = configparser.ConfigParser()
+    cp.read(MACHINE_CONF, encoding="utf-8-sig")
+    if not cp.has_section("makine"):
+        cp.add_section("makine")
+    for k, v in updates.items():
+        cp.set("makine", str(k), "" if v is None else str(v))
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = MACHINE_CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# Oyun İzleyici — bu PC'ye özel ayarlar\n"
+                "# kimlik: GitHub deposundaki klasör adı (değiştirme), ad: listelerde görünen isim\n"
+                "# mod: otomatik (2+ ekran = panel, tek ekran = sadece tepsi) | panel | tepsi\n")
+        cp.write(f)
+    os.replace(tmp, MACHINE_CONF)
 
 
 def _short_gpu_name(name):
@@ -1078,11 +1388,12 @@ class NvidiaPoller:
 class GpuReader:
     """Ekran kartını otomatik seçer: NVIDIA > en çok VRAM'li AMD > Intel."""
 
-    def __init__(self):
+    def __init__(self, lhm=None):
         self.kind = None
         self.dev = None
         self.hwmon = None
         self.nv = None
+        self.lhm = lhm
         self.fan_hwmon_input = None
         self.win_names = []
         if IS_WIN:
@@ -1126,10 +1437,17 @@ class GpuReader:
         if exe:
             self.kind = "nvidia"
             self.nv = NvidiaPoller(None, exe=exe)
+        elif self.lhm and self.lhm.available:
+            self.kind = "lhm"
         elif self.win_names:
             self.kind = "win"          # AMD / Intel: Windows'ta sürücüsüz sensör yok; sadece ad
 
     def name(self):
+        if self.kind == "lhm":
+            d = self.lhm.data if self.lhm else {}
+            if d.get("gpu_name"):
+                return _short_gpu_name(d["gpu_name"])
+            return _short_gpu_name(self.win_names[0]) if self.win_names else "GPU"
         if self.kind == "win":
             return _short_gpu_name(self.win_names[0]) if self.win_names else "GPU"
         if self.kind == "nvidia" and self.nv and self.nv.name:
@@ -1183,6 +1501,18 @@ class GpuReader:
                     t.vram_total_mb = int(dd["mem_total"])
                 if dd.get("fan") is not None:
                     t.fan_pct = int(dd["fan"])
+        elif self.kind == "lhm":
+            dd = self.lhm.data if self.lhm else {}
+            t.gpu_load = int(round(dd["gpu_load"])) if dd.get("gpu_load") is not None else 0
+            t.gpu_watt = int(round(dd["gpu_watt"])) if dd.get("gpu_watt") is not None else None
+            t.gpu_temp = int(round(dd["gpu_temp"])) if dd.get("gpu_temp") is not None else None
+            t.gpu_mhz = int(round(dd["gpu_mhz"])) if dd.get("gpu_mhz") is not None else 0
+            t.fan_rpm = int(round(dd["fan_rpm"])) if dd.get("fan_rpm") is not None else 0
+            t.fan_pct = int(round(dd["fan_pct"])) if dd.get("fan_pct") is not None else 0
+            if dd.get("vram_used") is not None:
+                t.vram_used_mb = int(round(dd["vram_used"]))
+            if dd.get("vram_total"):
+                t.vram_total_mb = max(1, int(round(dd["vram_total"])))
         elif self.kind == "win":
             t.gpu_load, t.gpu_watt, t.gpu_temp, t.gpu_mhz = 0, None, None, 0
         elif self.kind == "intel":
@@ -1542,11 +1872,129 @@ class WinThermal:
             pass
 
 
-class WinCpuReader:
-    """Windows: psutil ile yük / frekans / RAM, ısıl bölge sıcaklığı. İşlemci gücü (W) Windows'ta sürücüsüz okunamaz."""
+class WinLhmPoller:
+    """Windows: LibreHardwareMonitorLib.dll uzerinden AMD/NVIDIA/Intel GPU ve Ryzen/Intel CPU sensorlerini
+    tek bir gizli PowerShell surecinde 1 sn'de bir JSON satiri olarak okur."""
 
-    def __init__(self):
+    SCRIPT_TMPL = r"""
+$ErrorActionPreference='SilentlyContinue'
+Add-Type -Path '__DLL__'
+$c = New-Object LibreHardwareMonitor.Hardware.Computer
+$c.IsCpuEnabled = $true
+$c.IsGpuEnabled = $true
+$c.Open()
+function Pick($sensors, $type, $names) {
+    foreach ($n in $names) {
+        foreach ($s in $sensors) {
+            if ($s.SensorType.ToString() -eq $type -and $s.Name -eq $n -and $null -ne $s.Value) {
+                return [double]$s.Value
+            }
+        }
+    }
+    return $null
+}
+while ($true) {
+    $out = [ordered]@{}
+    $bestGpu = $null
+    $bestScore = -1
+    foreach ($hw in $c.Hardware) {
+        $hw.Update()
+        $ht = $hw.HardwareType.ToString()
+        if ($ht -eq 'Cpu') {
+            $cw = Pick $hw.Sensors 'Power' @('Package','CPU Package')
+            if ($null -ne $cw -and $cw -gt 0.1) { $out['cpu_watt'] = [math]::Round($cw, 2) }
+            $ct = Pick $hw.Sensors 'Temperature' @('Core (Tctl/Tdie)','CPU Package','CCD1 (Tdie)','Core Average')
+            if ($null -ne $ct -and $ct -gt 1.0) { $out['cpu_temp'] = [math]::Round($ct, 1) }
+            $cm = Pick $hw.Sensors 'Clock' @('Cores (Average)','Core #1')
+            if ($null -ne $cm -and $cm -gt 100.0) { $out['cpu_mhz'] = [math]::Round($cm, 1) }
+        } elseif ($ht -like 'Gpu*') {
+            $vt = Pick $hw.Sensors 'SmallData' @('GPU Memory Total','D3D Dedicated Memory Total')
+            $gp = Pick $hw.Sensors 'Power' @('GPU Package','GPU Core','GPU Total')
+            $gt = Pick $hw.Sensors 'Temperature' @('GPU Core','GPU Hot Spot')
+            $score = 0
+            if ($null -ne $gp) { $score += 100000 }
+            if ($null -ne $gt) { $score += 50000 }
+            if ($null -ne $vt) { $score += [int]$vt }
+            if ($hw.Sensors.Count -gt 0 -and $score -gt $bestScore) {
+                $bestScore = $score
+                $bestGpu = $hw
+            }
+        }
+    }
+    if ($null -ne $bestGpu) {
+        $s = $bestGpu.Sensors
+        $out['gpu_name']   = $bestGpu.Name
+        $out['gpu_load']   = Pick $s 'Load'        @('GPU Core','D3D 3D')
+        $out['gpu_watt']   = Pick $s 'Power'       @('GPU Package','GPU Core','GPU Total')
+        $out['gpu_temp']   = Pick $s 'Temperature' @('GPU Core','GPU Hot Spot')
+        $out['gpu_mhz']    = Pick $s 'Clock'       @('GPU Core')
+        $out['fan_rpm']    = Pick $s 'Fan'         @('GPU Fan','GPU Fan 1')
+        $out['fan_pct']    = Pick $s 'Control'     @('GPU Fan','GPU Fan 1')
+        $out['vram_used']  = Pick $s 'SmallData'   @('GPU Memory Used','D3D Dedicated Memory Used')
+        $out['vram_total'] = Pick $s 'SmallData'   @('GPU Memory Total','D3D Dedicated Memory Total')
+    }
+    Write-Output ($out | ConvertTo-Json -Compress)
+    [Console]::Out.Flush()
+    Start-Sleep -Milliseconds 1000
+}
+"""
+
+    def __init__(self, dll_path=LHM_DLL):
+        import threading
+        self.dll_path = dll_path
+        self.available = bool(IS_WIN and dll_path and os.path.isfile(dll_path))
+        self.data = {}
+        self.proc = None
+        self._stop = False
+        if self.available:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import base64
+        import json
+        import subprocess
+        script = self.SCRIPT_TMPL.replace("__DLL__", self.dll_path.replace("'", "''"))
+        b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        while not self._stop:
+            try:
+                self.proc = subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                     "-EncodedCommand", b64],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    encoding="utf-8", errors="replace", **_hidden())
+                for line in self.proc.stdout:
+                    if self._stop:
+                        break
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if isinstance(d, dict):
+                            self.data = d
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            if not self._stop:
+                time.sleep(3.0)
+
+    def stop(self):
+        self._stop = True
+        try:
+            if self.proc:
+                self.proc.terminate()
+        except Exception:
+            pass
+
+
+class WinCpuReader:
+    """Windows: psutil ile yük / çekirdekler, LibreHardwareMonitor varsa gerçek sıcaklık / güç / frekans,
+    yoksa ACPI ısıl bölge sıcaklığı."""
+
+    def __init__(self, lhm=None):
         self.ps = _win_psutil()
+        self.lhm = lhm
         self.name_full = _win_cpu_name()
         self.cores = [[0]]
         if self.ps:
@@ -1557,7 +2005,7 @@ class WinCpuReader:
             else:                                             # hibrit / SMT yok: her mantıksal işlemci ayrı
                 self.cores = [[i] for i in range(min(logical, 16))]
             self.ps.cpu_percent(percpu=True)                  # ilk çağrı boş döner: ısıt
-        self.thermal = WinThermal()
+        self.thermal = None if (lhm and lhm.available) else WinThermal()
 
     def name(self):
         return _short_cpu_name(self.name_full) if self.name_full else "CPU"
@@ -1574,12 +2022,21 @@ class WinCpuReader:
                 t.cpu_ghz = round(f.current / 1000.0, 2) if f and f.current else None
             except Exception:
                 t.cpu_ghz = None
-        c = self.thermal.celsius
-        t.cpu_temp = int(round(c)) if c is not None else None
-        t.cpu_watt = None
+        dd = self.lhm.data if (self.lhm and self.lhm.available) else {}
+        if dd.get("cpu_mhz"):
+            t.cpu_ghz = round(float(dd["cpu_mhz"]) / 1000.0, 2)
+        if dd.get("cpu_temp") is not None:
+            t.cpu_temp = int(round(float(dd["cpu_temp"])))
+        elif self.thermal is not None:
+            c = self.thermal.celsius
+            t.cpu_temp = int(round(c)) if c is not None else None
+        else:
+            t.cpu_temp = None
+        t.cpu_watt = int(round(float(dd["cpu_watt"]))) if dd.get("cpu_watt") is not None else None
 
     def stop(self):
-        self.thermal.stop()
+        if self.thermal is not None:
+            self.thermal.stop()
 
 
 def win_read_memory(t):
@@ -1598,7 +2055,7 @@ WIN_IGNORED_EXES = {
     "startmenuexperiencehost.exe", "textinputhost.exe", "applicationframehost.exe", "lockapp.exe",
     "widgets.exe", "widgetservice.exe", "systemsettings.exe", "taskmgr.exe", "msedgewebview2.exe",
     # tarayıcılar / ofis / sohbet / medya
-    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "zen.exe", "radeonsoftware.exe", "brave.exe", "opera.exe", "vivaldi.exe",
     "discord.exe", "teams.exe", "ms-teams.exe", "slack.exe", "spotify.exe", "whatsapp.exe", "telegram.exe",
     "code.exe", "devenv.exe", "obs64.exe", "obs32.exe", "vlc.exe", "mpv.exe", "wmplayer.exe", "video.ui.exe",
     "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "notepad.exe", "onedrive.exe",
@@ -1695,7 +2152,7 @@ class WinFrameCapture:
         import subprocess
         args = [self.exe, "--session_name", self.SESSION_NAME, "--stop_existing_session",
                 "--output_stdout", "--no_console_stats", "--v1_metrics"]
-        for n in ("dwm.exe", "explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+        for n in ("dwm.exe", "explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe", "zen.exe", "radeonsoftware.exe",
                   "python.exe", "pythonw.exe", "steamwebhelper.exe", "discord.exe"):
             args += ["--exclude", n]
         errlog = open(os.path.join(self.out_dir, "presentmon.log"), "w", encoding="utf-8")
@@ -1773,15 +2230,17 @@ class WinFrameCapture:
             return
         now = time.monotonic()
         ft = None
+        frame_ts = None
         try:
+            if idx["ts"] is not None:
+                frame_ts = float(parts[idx["ts"]])
             if idx["ft"] is not None:
                 ft = float(parts[idx["ft"]])
-            elif idx["ts"] is not None:
-                ts = float(parts[idx["ts"]])
+            elif frame_ts is not None:
                 prev = self._last_ts.get(pid)
-                self._last_ts[pid] = ts
+                self._last_ts[pid] = frame_ts
                 if prev is not None:
-                    ft = (ts - prev) * 1000.0
+                    ft = (frame_ts - prev) * 1000.0
         except (ValueError, IndexError):
             return
         if ft is None or not (0.05 <= ft <= 5000.0):
@@ -1791,7 +2250,7 @@ class WinFrameCapture:
             self._names[pid] = app
             self._frames.setdefault(pid, deque()).append((now, ft))
             if self._active is not None and self._active["pid"] == pid:
-                self._bucket.append(ft)
+                self._bucket.append((frame_ts if frame_ts is not None else now, ft))
 
     # --- 100 ms'lik zamanlayıcı: oyun seçimi + satır yazımı ---
     def _ticker(self):
@@ -1880,29 +2339,46 @@ class WinFrameCapture:
 
     def _write_bucket(self, act, now):
         b, self._bucket = self._bucket, []
-        if b:
-            ft = sum(b) / len(b)
-            act["last_frame"], act["last_ft"] = now, ft
-        elif act["n"] == 0:
-            return                                               # ilk kare gelmeden satır yazma
-        else:
-            silent_ms = (now - act["last_frame"]) * 1000.0
-            if silent_ms > self.STALL_WRITE_SEC * 1000.0:
-                return                                           # küçültüldü / duraklatıldı: satır yazma
-            ft = max(act["last_ft"], silent_ms)                  # takılma sırasında FPS düşerek görünür
-        fps = min(2000.0, max(1.0, 1000.0 / ft))
+        if not b:
+            # PresentMon stdout'u boruda 4 KB tamponlar (~0.4-1 sn'de bir toplu gelir);
+            # bos tiklerde sahte dusuk FPS satiri yazma.
+            return
+        # Toplu gelen kareleri PresentMon'un gercek zaman damgasina gore 100 ms dilimlere ayir
+        bins = []
+        cur_bin = None
+        cur_fts = []
+        for ts, ft in b:
+            bid = int(ts / self.BUCKET_SEC)
+            if cur_bin is None or bid != cur_bin:
+                if cur_fts:
+                    bins.append(cur_fts)
+                cur_bin = bid
+                cur_fts = [ft]
+            else:
+                cur_fts.append(ft)
+        if cur_fts:
+            bins.append(cur_fts)
+
         t = self.t
         v = lambda x: 0 if x is None else x
-        row = [f"{fps:.3f}", f"{ft:.3f}", v(getattr(t, "cpu_load", 0)), 0, v(getattr(t, "gpu_load", 0)),
-               v(getattr(t, "cpu_temp", 0)), v(getattr(t, "gpu_temp", 0)), v(getattr(t, "gpu_mhz", 0)), 0,
-               f"{v(getattr(t, 'vram_used_mb', 0)) / 1024.0:.3f}", v(getattr(t, "gpu_watt", 0)),
-               f"{v(getattr(t, 'ram_used_gb', 0)):.3f}", 0, 0, int(v(getattr(t, "cpu_ghz", 0)) * 1000),
-               int((now - act["start"]) * 1e9)]
+        lines = []
+        last_ft = act["last_ft"]
+        for fts in bins:
+            ft = sum(fts) / len(fts)
+            last_ft = ft
+            fps = min(2000.0, max(1.0, 1000.0 / ft))
+            row = [f"{fps:.3f}", f"{ft:.3f}", v(getattr(t, "cpu_load", 0)), v(getattr(t, "cpu_watt", 0)),
+                   v(getattr(t, "gpu_load", 0)), v(getattr(t, "cpu_temp", 0)), v(getattr(t, "gpu_temp", 0)),
+                   v(getattr(t, "gpu_mhz", 0)), 0, f"{v(getattr(t, 'vram_used_mb', 0)) / 1024.0:.3f}",
+                   v(getattr(t, "gpu_watt", 0)), f"{v(getattr(t, 'ram_used_gb', 0)):.3f}", 0, 0,
+                   int(v(getattr(t, "cpu_ghz", 0)) * 1000), int((now - act["start"]) * 1e9)]
+            lines.append(",".join(str(x) for x in row) + "\n")
+        act["last_frame"], act["last_ft"] = now, last_ft
         try:
-            act["fh"].write(",".join(str(x) for x in row) + "\n")
+            act["fh"].writelines(lines)
             act["fh"].flush()
-            act["n"] += 1
-            self.rows_written += 1
+            act["n"] += len(lines)
+            self.rows_written += len(lines)
         except OSError:
             self._close_active()
 
@@ -1938,8 +2414,9 @@ class HardwareTelemetry:
         self._last_scan = 0.0
         self._last_checkpoint = time.monotonic()
         self.cfg = load_machine_config()
-        self.gpu = GpuReader()
-        self.cpu = WinCpuReader() if IS_WIN else CpuReader()
+        self.lhm = WinLhmPoller() if IS_WIN else None
+        self.gpu = GpuReader(lhm=self.lhm)
+        self.cpu = WinCpuReader(lhm=self.lhm) if IS_WIN else CpuReader()
         self.capture = None
         self.on_ac = read_power_source()
 
@@ -2097,6 +2574,8 @@ class HardwareTelemetry:
             self.capture.stop()
         if hasattr(self.cpu, "stop"):
             self.cpu.stop()
+        if self.lhm is not None:
+            self.lhm.stop()
 
     def checkpoint_now(self):
         """Panel kapanırken süren oturumu yarım olarak kaydet (sonraki açılışta tamamlanır)."""
@@ -2257,33 +2736,125 @@ class HardwareTelemetry:
 
 
 # =============================================================================
+# DİNAMİK TEMA PALETİ (Klasik + Seçili Renk / KDE Edna Teması)
+# =============================================================================
+EDNA_ACCENT = "#10a6d4"
+
+
+def _mix_hex(base_rgb, acc_rgb, ratio):
+    r = int(round(base_rgb[0] * (1.0 - ratio) + acc_rgb[0] * ratio))
+    g = int(round(base_rgb[1] * (1.0 - ratio) + acc_rgb[1] * ratio))
+    b = int(round(base_rgb[2] * (1.0 - ratio) + acc_rgb[2] * ratio))
+    return f"#{max(0, min(255, r)):02x}{max(0, min(255, g)):02x}{max(0, min(255, b)):02x}"
+
+
+def theme_palette(theme="klasik", accent_hex="#40ff70"):
+    """Aktif panel temasına (Edna veya Klasik + vurgu rengi) uygun pencere/menü renk paleti."""
+    if theme == "edna":
+        return {
+            "accent": EDNA_ACCENT,
+            "bg": "#263238",
+            "surface": "#2c3a41",
+            "surface_alt": "#314048",
+            "surface_hi": "#37474f",
+            "hover": "#1f4656",
+            "border": "#3e5059",
+            "border_strong": "#546e7a",
+            "text": "#edf0f2",
+            "text_dim": "#9eb0ba",
+            "upd_bg": "#173f50",
+            "upd_hover": "#1e5870",
+            "danger_border": "#9e3f3f",
+            "danger_hover_bg": "#4a2328",
+            "danger_text": "#ff7a7a",
+            "pos_text": "#3ddc84",
+            "neg_text": "#ff6b6b",
+        }
+    c = QColor(accent_hex)
+    if not c.isValid():
+        c = QColor("#40ff70")
+    acc = (c.red(), c.green(), c.blue())
+    return {
+        "accent": c.name(),
+        "bg": _mix_hex((6, 8, 8), acc, 0.03),
+        "surface": _mix_hex((9, 11, 11), acc, 0.05),
+        "surface_alt": _mix_hex((12, 15, 15), acc, 0.07),
+        "surface_hi": _mix_hex((14, 18, 18), acc, 0.11),
+        "hover": _mix_hex((18, 22, 22), acc, 0.22),
+        "border": _mix_hex((22, 26, 26), acc, 0.16),
+        "border_strong": _mix_hex((30, 34, 34), acc, 0.28),
+        "text": "#f2f7f3",
+        "text_dim": _mix_hex((128, 138, 134), acc, 0.14),
+        "upd_bg": _mix_hex((14, 20, 18), acc, 0.20),
+        "upd_hover": _mix_hex((20, 30, 26), acc, 0.34),
+        "danger_border": "#7a2a2a",
+        "danger_hover_bg": "#3b1414",
+        "danger_text": "#ff6b6b",
+        "pos_text": "#40ff70",
+        "neg_text": "#ff6b6b",
+    }
+
+
+def build_history_style(theme="klasik", accent_hex="#40ff70"):
+    p = theme_palette(theme, accent_hex)
+    return f"""
+QWidget, QDialog {{ background-color: {p['bg']}; color: {p['text']};
+                    font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; font-size: 13px; }}
+QLabel {{ background: transparent; }}
+QLabel#title {{ color: {p['accent']}; font-size: 22px; font-weight: 900; }}
+QLabel#totals {{ color: {p['text']}; font-size: 15px; font-weight: 700; }}
+QLabel#gameSummary {{ color: {p['accent']}; font-size: 14px; font-weight: 700; padding: 6px;
+                      border: 1px solid {p['border_strong']}; border-radius: 6px; background: {p['surface']}; }}
+QLabel#footer {{ color: {p['text_dim']}; font-size: 11px; }}
+QFrame#cmpBanner {{ background: {p['surface']}; border: 1px solid {p['accent']}; border-radius: 8px; }}
+QTabWidget::pane {{ border: 1px solid {p['border_strong']}; border-radius: 6px; background: {p['bg']}; }}
+QTabBar::tab {{ background: {p['surface']}; color: {p['text_dim']}; padding: 8px 18px; font-weight: 700;
+                border: 1px solid {p['border']}; border-bottom: none; border-top-left-radius: 6px;
+                border-top-right-radius: 6px; margin-right: 2px; }}
+QTabBar::tab:selected {{ background: {p['hover']}; color: {p['accent']}; border-color: {p['border_strong']}; }}
+QTableWidget {{ background: {p['surface']}; alternate-background-color: {p['surface_alt']};
+                gridline-color: {p['border']}; border: none;
+                selection-background-color: {p['hover']}; selection-color: {p['accent']}; }}
+QTableCornerButton::section {{ background: {p['surface_hi']}; border: none; }}
+QHeaderView::section {{ background: {p['surface_hi']}; color: {p['accent']}; font-weight: 800; padding: 6px;
+                        border: none; border-right: 1px solid {p['border']};
+                        border-bottom: 1px solid {p['border_strong']}; }}
+QPushButton {{ background: {p['surface_hi']}; color: {p['text']}; border: 1px solid {p['border_strong']};
+               border-radius: 6px; padding: 7px 14px; font-weight: 700; }}
+QPushButton:hover {{ background: {p['hover']}; color: {p['accent']}; border-color: {p['accent']}; }}
+QPushButton:disabled {{ color: {p['text_dim']}; border-color: {p['border']}; }}
+QPushButton#primary {{ background: {p['upd_bg']}; color: {p['accent']}; border: 1px solid {p['accent']}; }}
+QPushButton#primary:hover {{ background: {p['upd_hover']}; color: #ffffff; }}
+QPushButton#danger {{ border-color: {p['danger_border']}; }}
+QPushButton#danger:hover {{ background: {p['danger_hover_bg']}; color: {p['danger_text']}; }}
+QComboBox {{ background: {p['surface_hi']}; color: {p['text']}; border: 1px solid {p['border_strong']};
+             border-radius: 6px; padding: 5px 10px; font-weight: 700; min-width: 220px; }}
+QComboBox QAbstractItemView {{ background: {p['surface']}; color: {p['text']};
+                               selection-background-color: {p['hover']}; selection-color: {p['accent']};
+                               border: 1px solid {p['border_strong']}; }}
+QLineEdit, QPlainTextEdit {{ background: {p['surface']}; color: {p['text']};
+                             border: 1px solid {p['border_strong']}; border-radius: 6px; padding: 6px 8px; }}
+QLineEdit:focus, QPlainTextEdit:focus {{ border-color: {p['accent']}; }}
+QCheckBox {{ color: {p['text']}; spacing: 6px; }}
+QMessageBox QLabel {{ color: {p['text']}; }}
+"""
+
+
+def build_menu_style(theme="klasik", accent_hex="#40ff70"):
+    p = theme_palette(theme, accent_hex)
+    return f"""
+QMenu {{ background-color: {p['surface']}; color: {p['text']}; border: 1px solid {p['accent']}; font-weight: bold; }}
+QMenu::item {{ padding: 6px 20px; }}
+QMenu::item:selected {{ background-color: {p['hover']}; color: {p['accent']}; }}
+QMenu::item:disabled {{ color: {p['text_dim']}; }}
+QMenu::separator {{ height: 1px; background: {p['border_strong']}; margin: 4px 8px; }}
+"""
+
+
+# =============================================================================
 # OYUN GEÇMİŞİ PENCERESİ (sağ üstteki ⋮ butonu)
 # =============================================================================
-HISTORY_STYLE = """
-QWidget { background-color: #070b09; color: #f2f7f3; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; font-size: 13px; }
-QLabel#title { color: #40ff70; font-size: 22px; font-weight: 900; }
-QLabel#totals { color: #ffffff; font-size: 15px; font-weight: 700; }
-QLabel#gameSummary { color: #40ff70; font-size: 14px; font-weight: 700; padding: 6px;
-                     border: 1px solid #24402e; border-radius: 6px; background: #0b140f; }
-QLabel#footer { color: #7d9a86; font-size: 11px; }
-QTabWidget::pane { border: 1px solid #24402e; border-radius: 6px; }
-QTabBar::tab { background: #0c1410; color: #a9c4b1; padding: 8px 18px; font-weight: 700;
-               border: 1px solid #24402e; border-bottom: none; border-top-left-radius: 6px;
-               border-top-right-radius: 6px; margin-right: 2px; }
-QTabBar::tab:selected { background: #15291c; color: #40ff70; }
-QTableWidget { background: #090f0c; alternate-background-color: #0d1611; gridline-color: #1b2e22;
-               border: none; selection-background-color: #1b3b26; selection-color: #40ff70; }
-QHeaderView::section { background: #0f1c14; color: #40ff70; font-weight: 800; padding: 6px;
-                       border: none; border-right: 1px solid #1b2e22; border-bottom: 1px solid #24402e; }
-QPushButton { background: #0f1c14; color: #ffffff; border: 1px solid #2d5c3b; border-radius: 6px;
-              padding: 7px 14px; font-weight: 700; }
-QPushButton:hover { background: #1b3b26; color: #40ff70; }
-QPushButton#danger { border-color: #7a2a2a; }
-QPushButton#danger:hover { background: #3b1414; color: #ff6b6b; }
-QComboBox { background: #0f1c14; border: 1px solid #2d5c3b; border-radius: 6px; padding: 5px 10px;
-            font-weight: 700; min-width: 220px; }
-QComboBox QAbstractItemView { background: #0c1410; selection-background-color: #1b3b26; }
-"""
+HISTORY_STYLE = build_history_style()
 
 
 def _num(v, d=0, suffix=""):
@@ -2298,15 +2869,258 @@ def _date(ts, with_time=True):
     return time.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y", time.localtime(ts))
 
 
+class GitHubSyncDialog(QWidget):
+    """GitHub kayıt deposunu uygulama içinden bağlama penceresi (Token API veya Git/SSH)."""
+
+    @staticmethod
+    def run(parent, sync, theme="klasik", accent_hex="#40ff70"):
+        import subprocess
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+            QTabWidget, QPlainTextEdit, QMessageBox, QCheckBox, QWidget as _QWidget
+        )
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("GitHub Kayıt Deposu Bağla — PC Karşılaştırma")
+        dlg.setStyleSheet(build_history_style(theme, accent_hex))
+        dlg.resize(620, 470)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(10)
+
+        hdr = QLabel("🔗 GITHUB KAYIT DEPOSU BAĞLA")
+        hdr.setObjectName("title")
+        lay.addWidget(hdr)
+
+        desc = QLabel(
+            "Diğer PC'lerdeki oyun kayıtlarını çekmek ve bu PC'nin oturumlarını paylaşmak için "
+            "kendi özel GitHub kayıt deponu bağla (ör. cdokuro/oyun-kayitlari)."
+        )
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+
+        repo_row = QHBoxLayout()
+        repo_row.addWidget(QLabel("Kayıt Deposu:"))
+        repo_in = QLineEdit(sync.repo_slug if sync and sync.repo_slug else "")
+        repo_in.setPlaceholderText("sahip/depo  veya  https://github.com/sahip/depo")
+        repo_row.addWidget(repo_in, 1)
+        lay.addLayout(repo_row)
+
+        tabs = QTabWidget()
+        lay.addWidget(tabs, 1)
+
+        # --- Sekme 1: GitHub Token (Git gerekmez — Windows'ta en kolay yol) ---
+        api_tab = _QWidget()
+        av = QVBoxLayout(api_tab)
+        av.setContentsMargins(12, 12, 12, 10)
+        av.setSpacing(8)
+        av_info = QLabel(
+            "Bu yöntem Git veya SSH kurulumu gerektirmez; doğrudan GitHub API ile senkronize olur.\n"
+            "GitHub'da yalnızca kayıt depon için 'Contents: Read and write' izinli bir Personal Access Token oluştur."
+        )
+        av_info.setWordWrap(True)
+        av.addWidget(av_info)
+
+        tok_row = QHBoxLayout()
+        tok_row.addWidget(QLabel("GitHub Token:"))
+        tok_in = QLineEdit(read_github_token())
+        tok_in.setEchoMode(QLineEdit.EchoMode.Password)
+        tok_in.setPlaceholderText("github_pat_... veya ghp_... (herkese açık depo için boş bırakılabilir)")
+        tok_row.addWidget(tok_in, 1)
+        chk_show = QCheckBox("Göster")
+        chk_show.toggled.connect(
+            lambda on: tok_in.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        tok_row.addWidget(chk_show)
+        av.addLayout(tok_row)
+
+        tok_btns = QHBoxLayout()
+        b_open_tok = QPushButton("🌐 GitHub'da Token Oluştur")
+        b_open_tok.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl("https://github.com/settings/personal-access-tokens/new")))
+        tok_btns.addWidget(b_open_tok)
+        tok_btns.addStretch(1)
+        b_save_api = QPushButton("✓ Test Et ve Bağla")
+        b_save_api.setObjectName("primary")
+        tok_btns.addWidget(b_save_api)
+        av.addLayout(tok_btns)
+        av.addStretch(1)
+        tabs.addTab(api_tab, "🔑 GitHub Token (Önerilen — Git gerekmez)")
+
+        # --- Sekme 2: SSH Deploy Key (Git) ---
+        ssh_tab = _QWidget()
+        sv = QVBoxLayout(ssh_tab)
+        sv.setContentsMargins(12, 12, 12, 10)
+        sv.setSpacing(8)
+        git_exe = find_git_exe()
+        git_lbl = QLabel(
+            f"Git bulundu: {git_exe}" if git_exe else
+            "⚠ Bu PC'de git kurulu değil. Git kurmadan devam etmek için 'GitHub Token' sekmesini kullanabilirsin."
+        )
+        git_lbl.setWordWrap(True)
+        sv.addWidget(git_lbl)
+
+        pub_box = QPlainTextEdit()
+        pub_box.setReadOnly(True)
+        pub_box.setFixedHeight(74)
+        pub_box.setPlaceholderText("SSH genel anahtarı henüz oluşturulmadı — 'Anahtar Oluştur / Yenile'ye tıkla.")
+        existing_pub = ssh_key_path() + ".pub"
+        if os.path.isfile(existing_pub):
+            try:
+                with open(existing_pub, encoding="utf-8") as f:
+                    pub_box.setPlainText(f.read().strip())
+            except OSError:
+                pass
+        sv.addWidget(pub_box)
+
+        ssh_btns = QHBoxLayout()
+        b_gen = QPushButton("🔐 Anahtar Oluştur")
+        b_copy = QPushButton("📋 Kopyala")
+        b_keys = QPushButton("🌐 Deploy Key Sayfasını Aç")
+        b_clone = QPushButton("✓ Depoyu Bağla (SSH)")
+        b_clone.setObjectName("primary")
+        b_clone.setEnabled(bool(git_exe))
+        for b in (b_gen, b_copy, b_keys):
+            ssh_btns.addWidget(b)
+        ssh_btns.addStretch(1)
+        ssh_btns.addWidget(b_clone)
+        sv.addLayout(ssh_btns)
+        sv.addStretch(1)
+        tabs.addTab(ssh_tab, "🔐 SSH Deploy Key (Git)")
+
+        if sync and sync.mode == "git":
+            tabs.setCurrentIndex(1)
+
+        status_lbl = QLabel()
+        status_lbl.setObjectName("footer")
+        status_lbl.setWordWrap(True)
+        lay.addWidget(status_lbl)
+
+        bottom = QHBoxLayout()
+        if sync and sync.enabled:
+            b_disc = QPushButton("Bağlantıyı Kaldır")
+            b_disc.setObjectName("danger")
+
+            def _do_disconnect():
+                sync.disconnect()
+                dlg.accept()
+
+            b_disc.clicked.connect(_do_disconnect)
+            bottom.addWidget(b_disc)
+        bottom.addStretch(1)
+        b_close = QPushButton("Kapat")
+        b_close.clicked.connect(dlg.reject)
+        bottom.addWidget(b_close)
+        lay.addLayout(bottom)
+
+        def _gen_key():
+            try:
+                _, pub_txt = ensure_ssh_key()
+                pub_box.setPlainText(pub_txt)
+                status_lbl.setText("SSH anahtarı hazır. Kopyalayıp GitHub deponda 'Allow write access' ile Deploy Key olarak ekle.")
+            except Exception as e:
+                QMessageBox.warning(dlg, "SSH Anahtarı", str(e))
+
+        def _copy_key():
+            txt = pub_box.toPlainText().strip()
+            if not txt:
+                _gen_key()
+                txt = pub_box.toPlainText().strip()
+            if txt:
+                QApplication.clipboard().setText(txt)
+                status_lbl.setText("Genel anahtar panoya kopyalandı.")
+
+        def _open_deploy_keys():
+            slug = normalize_repo_slug(repo_in.text())
+            if not slug:
+                QMessageBox.information(dlg, "Depo Adı", "Önce üstteki alana 'sahip/depo' şeklinde depo adını yaz.")
+                return
+            QDesktopServices.openUrl(QUrl(f"https://github.com/{slug}/settings/keys"))
+
+        def _save_api():
+            slug = normalize_repo_slug(repo_in.text())
+            if not slug:
+                QMessageBox.warning(dlg, "Depo Adı", "Geçerli bir depo adı gir (ör. cdokuro/oyun-kayitlari).")
+                return
+            tok = tok_in.text().strip()
+            status_lbl.setText("GitHub deposuna bağlantı test ediliyor…")
+            QApplication.processEvents()
+            try:
+                _, repo = github_api_request("GET", f"https://api.github.com/repos/{slug}", token=tok)
+                if repo.get("private") and not tok:
+                    raise RuntimeError("Özel depo için GitHub Token gerekli.")
+                sync.configure_api(slug, tok)
+                dlg.accept()
+            except Exception as e:
+                status_lbl.setText(f"Hata: {e}")
+                QMessageBox.warning(dlg, "Bağlantı Hatası",
+                                    f"Depoya erişilemedi:\n{e}\n\n"
+                                    "Depo adını ve token yetkisini (Contents: Read & Write) kontrol et.")
+
+        def _connect_ssh():
+            slug = normalize_repo_slug(repo_in.text())
+            if not slug:
+                QMessageBox.warning(dlg, "Depo Adı", "Geçerli bir depo adı gir (ör. cdokuro/oyun-kayitlari).")
+                return
+            if not git_exe:
+                QMessageBox.warning(dlg, "Git Yok", "Git bulunamadı. 'GitHub Token' sekmesini kullanabilirsin.")
+                return
+            try:
+                key, pub_txt = ensure_ssh_key()
+                pub_box.setPlainText(pub_txt)
+            except Exception as e:
+                QMessageBox.warning(dlg, "SSH Anahtarı", str(e))
+                return
+            key_fwd = key.replace("\\", "/")
+            ssh_cmd = f'ssh -i "{key_fwd}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+            env = dict(os.environ, GIT_SSH_COMMAND=ssh_cmd, GIT_TERMINAL_PROMPT="0")
+            status_lbl.setText("SSH ile depo bağlanıyor…")
+            QApplication.processEvents()
+            try:
+                if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+                    p = subprocess.run([git_exe, "-C", REPO_DIR, "remote", "set-url", "origin",
+                                        f"git@github.com:{slug}.git"],
+                                       capture_output=True, text=True, timeout=30, env=env, **_hidden())
+                else:
+                    if os.path.isdir(REPO_DIR):
+                        import shutil
+                        shutil.rmtree(REPO_DIR, ignore_errors=True)
+                    p = subprocess.run([git_exe, "clone", "-q", f"git@github.com:{slug}.git", REPO_DIR],
+                                       capture_output=True, text=True, timeout=60, env=env, **_hidden())
+                if p.returncode != 0:
+                    err = (p.stderr or p.stdout or "git clone başarısız").strip()
+                    raise RuntimeError(err)
+                subprocess.run([git_exe, "-C", REPO_DIR, "config", "core.sshCommand", ssh_cmd],
+                               capture_output=True, text=True, timeout=15, env=env, **_hidden())
+                sync.configure_git(slug)
+                dlg.accept()
+            except Exception as e:
+                status_lbl.setText(f"SSH hatası: {e}")
+                QMessageBox.warning(dlg, "SSH Bağlantı Hatası",
+                                    f"Depo klonlanamadı:\n{e}\n\n"
+                                    "Genel anahtarı GitHub'daki Deploy Keys sayfasına 'Allow write access' "
+                                    "işaretli olarak eklediğinden emin ol.")
+
+        b_gen.clicked.connect(_gen_key)
+        b_copy.clicked.connect(_copy_key)
+        b_keys.clicked.connect(_open_deploy_keys)
+        b_save_api.clicked.connect(_save_api)
+        b_clone.clicked.connect(_connect_ssh)
+        return dlg.exec() == QDialog.DialogCode.Accepted
+
+
 class HistoryWindow(QWidget):
-    def __init__(self, store, sync=None):
+    def __init__(self, store, sync=None, theme="klasik", accent_hex="#40ff70"):
         from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel, QTabWidget, QTableWidget,
-                                       QPushButton, QComboBox, QAbstractItemView, QHeaderView, QCheckBox)
+                                       QPushButton, QComboBox, QAbstractItemView, QHeaderView, QCheckBox, QFrame)
         super().__init__()
         self.store = store
         self.sync = sync
+        self.theme = theme if theme in ("klasik", "edna") else "klasik"
+        self.accent_hex = accent_hex or "#40ff70"
         self.setWindowTitle("Oyun Geçmişi — Oyun İzleyici")
-        self.setStyleSheet(HISTORY_STYLE)
         self.resize(1240, 700)
 
         root = QVBoxLayout(self)
@@ -2370,6 +3184,21 @@ class HistoryWindow(QWidget):
         cmp_page = QWidget()
         cv = QVBoxLayout(cmp_page)
         cv.setContentsMargins(8, 10, 8, 8)
+
+        # Diğer PC kaydı yoksa doğrudan bağlantı yönlendirme çubuğu
+        self.cmp_banner = QFrame()
+        self.cmp_banner.setObjectName("cmpBanner")
+        bl = QHBoxLayout(self.cmp_banner)
+        bl.setContentsMargins(12, 10, 12, 10)
+        self.cmp_banner_lbl = QLabel()
+        self.cmp_banner_lbl.setWordWrap(True)
+        bl.addWidget(self.cmp_banner_lbl, 1)
+        self.b_cmp_connect = QPushButton("🔗 GitHub Kayıt Deposu Bağla")
+        self.b_cmp_connect.setObjectName("primary")
+        self.b_cmp_connect.clicked.connect(self._on_cmp_banner_action)
+        bl.addWidget(self.b_cmp_connect)
+        cv.addWidget(self.cmp_banner)
+
         cl = QHBoxLayout()
         cl.addWidget(QLabel("A:"))
         self.cmp_a = QComboBox()
@@ -2418,7 +3247,8 @@ class HistoryWindow(QWidget):
             tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.games_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.sess_tbl.horizontalHeader().setSectionResizeMode(len(self.SESS_COLS) - 1, QHeaderView.ResizeMode.Stretch)
-        self.cmp_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.cmp_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.cmp_tbl.setColumnWidth(0, 200)
 
         btns = QHBoxLayout()
         b_del = QPushButton("Seçili Oturumu Sil")
@@ -2428,20 +3258,21 @@ class HistoryWindow(QWidget):
         b_csv.clicked.connect(self._export_csv)
         b_bak = QPushButton("Şimdi Yedekle")
         b_bak.clicked.connect(self._backup_now)
-        b_sync = QPushButton("GitHub ile Senkronize Et")
-        b_sync.clicked.connect(self._sync_now)
+        self.b_sync = QPushButton("GitHub ile Senkronize Et")
+        self.b_sync.clicked.connect(self._sync_now)
+        self.b_repo = QPushButton("🔗 Depo Bağla")
+        self.b_repo.clicked.connect(self._open_sync_setup)
         self.b_upd = QPushButton("⬆ Uygulamayı Şimdi Güncelle")
-        self.b_upd.setStyleSheet("QPushButton { background: #184226; color: #40ff70; border: 1px solid #40ff70; } "
-                                 "QPushButton:hover { background: #246339; color: #ffffff; }")
+        self.b_upd.setObjectName("primary")
         self.b_upd.clicked.connect(lambda: apply_app_update())
         self.b_upd.setVisible(bool(self.sync and self.sync.update_available))
         b_dir = QPushButton("Kayıt Klasörünü Aç")
         b_dir.clicked.connect(self._open_folder)
         b_help = QPushButton("📖 Kısayollar ve Rehber")
-        b_help.clicked.connect(lambda: show_shortcuts_guide(self))
+        b_help.clicked.connect(lambda: show_shortcuts_guide(self, self.accent_hex, self.theme))
         b_ref = QPushButton("Yenile")
         b_ref.clicked.connect(self.refresh)
-        for b in (b_del, b_csv, b_bak, b_sync, self.b_upd, b_dir, b_help):
+        for b in (b_del, b_csv, b_bak, self.b_sync, self.b_repo, self.b_upd, b_dir, b_help):
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(b_ref)
@@ -2454,10 +3285,39 @@ class HistoryWindow(QWidget):
         self.footer.setObjectName("footer")
         root.addWidget(self.footer)
 
+        self.apply_theme(self.theme, self.accent_hex)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
         self.refresh_timer.start(30000)
         self.refresh()
+
+    def apply_theme(self, theme, accent_hex):
+        self.theme = theme if theme in ("klasik", "edna") else "klasik"
+        self.accent_hex = accent_hex or "#40ff70"
+        self.setStyleSheet(build_history_style(self.theme, self.accent_hex))
+        if hasattr(self, "cmp_tbl") and self.cmp_tbl.rowCount() > 0:
+            self._fill_compare()
+
+    def open_compare(self):
+        self.tabs.setCurrentIndex(2)
+        if self.cmp_a.count() >= 2 and self.cmp_a.currentData() == self.cmp_b.currentData():
+            self.cmp_a.setCurrentIndex(0)
+            self.cmp_b.setCurrentIndex(1)
+        self._fill_compare()
+
+    def _on_cmp_banner_action(self):
+        if self.sync is not None and self.sync.enabled:
+            self._sync_now()
+        else:
+            self._open_sync_setup()
+
+    def _open_sync_setup(self):
+        if self.sync is None:
+            return
+        if GitHubSyncDialog.run(self, self.sync, self.theme, self.accent_hex):
+            self.refresh()
+            if self.sync.enabled:
+                self.sync_lbl.setText("GitHub: senkronize ediliyor…")
 
     # --- yardımcılar ---
     @staticmethod
@@ -2559,6 +3419,7 @@ class HistoryWindow(QWidget):
         if self.sync is not None:
             self.sync_lbl.setText(self.sync.status_text())
             self.b_upd.setVisible(bool(self.sync.update_available))
+            self.b_repo.setText("⚙ Depo Ayarı" if self.sync.enabled else "🔗 GitHub Bağla")
         backups = self.store.list_backups()
         last_bak = os.path.basename(backups[-1]) if backups else "yok"
         self.footer.setText(f"Bu PC: {self._names().get(self.store.machine_id)} ({self.store.machine_id})   ·   "
@@ -2620,6 +3481,24 @@ class HistoryWindow(QWidget):
         names = self._names()
         machines = {m["machine_id"]: m for m in self.store.machines()}
         ac_only = self.cmp_ac.isChecked()
+        pal = theme_palette(self.theme, self.accent_hex)
+
+        if len(machines) < 2:
+            if self.sync is not None and self.sync.enabled:
+                self.cmp_banner_lbl.setText(
+                    "GitHub kayıt deposu bağlı, ancak henüz başka bir PC'den kayıt görünmüyor. "
+                    "Diğer PC'de de aynı kayıt deposunu bağladıktan sonra senkronize et."
+                )
+                self.b_cmp_connect.setText("🔄 Şimdi Senkronize Et")
+            else:
+                self.cmp_banner_lbl.setText(
+                    "Henüz karşılaştırılacak ikinci bir PC yok. Diğer PC'lerdeki oyun kayıtlarını çekip "
+                    "doğrudan karşılaştırmak için özel GitHub kayıt deponu buradan bağla."
+                )
+                self.b_cmp_connect.setText("🔗 GitHub Kayıt Deposu Bağla")
+            self.cmp_banner.show()
+        else:
+            self.cmp_banner.hide()
 
         def card(mid):
             m = machines.get(mid, {})
@@ -2652,7 +3531,7 @@ class HistoryWindow(QWidget):
             li = I(ld, ldv)
             for it, v in ((fi, fdv), (li, ldv)):
                 if v is not None:
-                    it.setForeground(QColor(64, 255, 112) if v >= 0 else QColor(255, 107, 107))
+                    it.setForeground(QColor(pal["pos_text"]) if v >= 0 else QColor(pal["neg_text"]))
             rows.append([
                 I(game, game, align_right=False),
                 I(fmt_duration(ra["secs"]), ra["secs"]), I(fmt_duration(rb["secs"]), rb["secs"]),
@@ -2741,10 +3620,8 @@ class HistoryWindow(QWidget):
         QMessageBox.information(self, "Yedek", "Yedek alındı:\n" + self.store.list_backups()[-1])
 
     def _sync_now(self):
-        from PySide6.QtWidgets import QMessageBox
         if self.sync is None or not self.sync.enabled:
-            QMessageBox.information(self, "GitHub", "Bu PC'de GitHub senkronu kurulmamış.\n"
-                                    f"Kurulum için depodaki kur.sh betiğini çalıştır ({REPO_DIR}).")
+            self._open_sync_setup()
             return
         self.sync.request()
         self.sync_lbl.setText("GitHub: senkronize ediliyor…")
@@ -2763,7 +3640,6 @@ HEADER_H = 46   # üstteki saat / tarih şeridinin mantıksal yüksekliği (kapa
 TR_DAYS = ["PAZARTESİ", "SALI", "ÇARŞAMBA", "PERŞEMBE", "CUMA", "CUMARTESİ", "PAZAR"]
 TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül",
              "Ekim", "Kasım", "Aralık"]
-EDNA_ACCENT = "#10a6d4"
 
 
 def tier_color(pct, base, edna):
@@ -2832,18 +3708,21 @@ def draw_edna_landscape(p, W, y0, h):
     p.drawEllipse(QPointF(tx + 3, ty - 8.8), 3.3, 3.0)
 
 
-def show_shortcuts_guide(parent=None, accent_hex="#40ff70"):
+def show_shortcuts_guide(parent=None, accent_hex="#40ff70", theme="klasik"):
     from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
+    p = theme_palette(theme, accent_hex)
+    acc = p["accent"]
     dlg = QDialog(parent)
     dlg.setWindowTitle("Kısayollar ve Kullanım Rehberi — Oyun İzleyici")
-    dlg.resize(560, 520)
+    dlg.resize(560, 540)
     dlg.setStyleSheet(f"""
-        QDialog {{ background-color: #070b09; color: #f2f7f3; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; }}
-        QLabel#hdr {{ color: {accent_hex}; font-size: 19px; font-weight: 900; padding-bottom: 4px; }}
-        QLabel#body {{ color: #e4efe7; font-size: 13px; line-height: 1.45; }}
-        QPushButton {{ background: #0f1c14; color: #ffffff; border: 1px solid {accent_hex};
+        QDialog {{ background-color: {p['bg']}; color: {p['text']}; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; }}
+        QLabel {{ background: transparent; }}
+        QLabel#hdr {{ color: {acc}; font-size: 19px; font-weight: 900; padding-bottom: 4px; }}
+        QLabel#body {{ color: {p['text']}; font-size: 13px; line-height: 1.45; }}
+        QPushButton {{ background: {p['surface_hi']}; color: {p['text']}; border: 1px solid {acc};
                        border-radius: 6px; padding: 8px 20px; font-weight: 800; }}
-        QPushButton:hover {{ background: #1b3b26; color: {accent_hex}; }}
+        QPushButton:hover {{ background: {p['hover']}; color: {acc}; }}
     """)
     lay = QVBoxLayout(dlg)
     lay.setContentsMargins(20, 18, 20, 16)
@@ -2855,21 +3734,22 @@ def show_shortcuts_guide(parent=None, accent_hex="#40ff70"):
 
     guide_html = f"""
     <div style="line-height:1.55;">
-      <p><b style="color:{accent_hex};">🖱️ PANEL KONTROLLERİ &amp; FARE KISAYOLLARI</b><br>
-      • <b>Sol Üst Ayarlar Çarkı (⚙) veya Sağ Tık:</b> Ayarlar, Tema Rengi, Oyun Geçmişi ve MangoHud menüsünü açar.<br>
+      <p><b style="color:{acc};">🖱️ PANEL KONTROLLERİ &amp; FARE KISAYOLLARI</b><br>
+      • <b>Sol Üst Ayarlar Çarkı (⚙) veya Sağ Tık:</b> Ayarlar, Tema Rengi, Oyun Geçmişi, PC Karşılaştırma ve MangoHud menüsünü açar.<br>
       • <b>Sol Tık + Sürükle:</b> Paneli ekranda istediğin yere taşır (konumu otomatik kaydedilir).<br>
       • <b>Fare Tekerleği (Yukarı / Aşağı):</b> Panelin boyutunu büyütür veya küçültür (<code>%70 – %150</code>).<br>
       • <b>Ctrl + Fare Tekerleği:</b> <b>Arka Plan &amp; Çizgi Saydamlığını</b> ayarlar (<code>%0 Tam Şeffaf – %100 Opak</code>).<br>
-      &nbsp;&nbsp;<i>Not: Saydamlık kısıldığında yazılar, FPS sayıları ve grafikler %100 net/opak kalır; sadece siyah arka plan ve çerçeve çizgileri şeffaflaşır!</i></p>
+      &nbsp;&nbsp;<i>Not: Saydamlık kısıldığında yazılar, FPS sayıları ve grafikler %100 net/opak kalır; sadece arka plan ve çerçeve çizgileri şeffaflaşır!</i></p>
 
-      <p><b style="color:{accent_hex};">🎮 OYUN İÇİ GÖSTERGE (MANGOHUD) KISAYOLLARI</b><br>
+      <p><b style="color:{acc};">🎮 OYUN İÇİ GÖSTERGE (MANGOHUD) KISAYOLLARI</b><br>
       • <b>Sağ Shift + F12:</b> Oyun içindeyken MangoHud FPS göstergesini anında gizler veya gösterir.<br>
       • <b>Otomatik Kayıt &amp; Akıllı Menü Filtresi:</b> MangoHud gizli modda olsa bile arka planda FPS kaydedilir. Menü ve yükleme ekranlarındaki 1000+ FPS patlamaları otomatik filtrelenerek sadece gerçek 3D oyun içi ortalaman (<code>AVG</code> ve <code>1% LOW</code>) hesaplanır.</p>
 
-      <p><b style="color:{accent_hex};">📊 OYUN GEÇMİŞİ &amp; SENKRONİZASYON</b><br>
-      • <b>Not Ekleme:</b> Oyun Geçmişi &rarr; <i>Oturumlar</i> sekmesinde bir oturumun <b>Not</b> hücresine çift tıklayarak çözünürlük/ayar notu (ör. <i>1440p Ultra, FSR Kalite</i>) ekleyebilirsin.<br>
-      • <b>Oyun Detayı:</b> <i>Oyunlar (Toplam)</i> sekmesinde bir oyuna çift tıklayarak o oyunun tüm oturumlarını açabilirsin.<br>
-      • <b>Tek Tıkla Güncelleme:</b> GitHub'a yeni sürüm geldiğinde panelin en altında <b style="color:{accent_hex};">⬆ GÜNCELLEME VAR</b> butonu çıkar; tıkladığında otomatik güncellenir.<br></p>
+      <p><b style="color:{acc};">⚖️ OYUN GEÇMİŞİ &amp; PC KARŞILAŞTIRMA</b><br>
+      • <b>Doğrudan PC Karşılaştırma:</b> Panel sağ tık / ayar çarkı veya sistem tepsisi menüsünden <b>PC Karşılaştırma</b> seçeneğiyle tek tıkla karşılaştırma sekmesine geçebilirsin.<br>
+      • <b>Kolay GitHub Bağlantısı:</b> <i>PC Karşılaştırma</i> sekmesinden veya <i>GitHub Deposu Bağla</i> butonundan özel kayıt deponu GitHub Token (Git gerekmez) veya SSH Deploy Key ile doğrudan bağlayabilirsin.<br>
+      • <b>Not Ekleme &amp; Detay:</b> <i>Oturumlar</i> sekmesinde <b>Not</b> hücresine çift tıklayarak ayar notu ekleyebilir, <i>Oyunlar</i> sekmesinde bir oyuna çift tıklayarak oturumlarını açabilirsin.<br>
+      • <b>Tek Tıkla Güncelleme:</b> GitHub'a yeni sürüm geldiğinde panelin en altında <b style="color:{acc};">⬆ GÜNCELLEME VAR</b> butonu çıkar; tıkladığında otomatik güncellenir.</p>
     </div>
     """
     body = QLabel(guide_html)
@@ -3000,11 +3880,16 @@ class HudWindow(QWidget):
             self.settings.setValue(f"overlay_{k}", v)
         self.settings.sync()
 
+    def _sync_history_theme(self):
+        if self.history_win is not None:
+            self.history_win.apply_theme(self.theme, self.accent_hex)
+
     def set_theme(self, name):
         self.theme = name if name in ("klasik", "edna") else "klasik"
         if self.theme == "edna":
             self.accent_hex = EDNA_ACCENT
         self.save_settings()
+        self._sync_history_theme()
         self.update()
 
     def set_show_clock(self, on):
@@ -3021,6 +3906,7 @@ class HudWindow(QWidget):
             self.theme = "klasik"
             self.accent_hex = c.name()
             self.save_settings()
+            self._sync_history_theme()
             self.update()
 
     def pick_accent_color(self):
@@ -3129,6 +4015,7 @@ class HudWindow(QWidget):
 
     def _fill_tray_menu(self, menu):
         menu.clear()
+        menu.setStyleSheet(build_menu_style(self.theme, self.accent_hex))
         self._menu_sync = []
         if self.sync and self.sync.update_available:
             act_u = menu.addAction("⬆ Yeni Güncelleme Var — Şimdi Güncelle!", lambda: apply_app_update(self))
@@ -3136,10 +4023,13 @@ class HudWindow(QWidget):
             f.setBold(True)
             act_u.setFont(f)
             menu.addSeparator()
-        menu.addAction("📊 Oyun Geçmişi…", self.open_history)
-        menu.addAction("📖 Kısayollar ve Kullanım Rehberi…", lambda: show_shortcuts_guide(self, self.accent_hex))
+        menu.addAction("📊 Oyun Geçmişi…", lambda _=False: self.open_history())
+        menu.addAction("⚖️ PC Karşılaştırma…", lambda _=False: self.open_compare())
+        menu.addAction("📖 Kısayollar ve Kullanım Rehberi…",
+                       lambda: show_shortcuts_guide(self, self.accent_hex, self.theme))
         menu.addAction("🙈 Paneli Gizle" if self.isVisible() else "👁️ Paneli Göster", self.toggle_panel)
-        menu.addAction("🔄 GitHub ile Senkronize Et", lambda: self.sync and self.sync.request())
+        menu.addAction("🔄 GitHub ile Senkronize Et" if (self.sync and self.sync.enabled)
+                       else "🔗 GitHub Deposu Bağla…", self.sync_or_connect)
         menu.addSeparator()
         self._add_color_menu(menu)
         self._add_overlay_menu(menu)
@@ -3217,16 +4107,33 @@ class HudWindow(QWidget):
         self.telemetry.checkpoint_now()
         self.telemetry.stop()
 
-    def open_history(self):
+    def open_history(self, tab_index=None):
         if self.store is None:
             notify("Oyun İzleyici", "Kayıt veritabanı açılamadığı için geçmiş gösterilemiyor.")
             return
         if self.history_win is None:
-            self.history_win = HistoryWindow(self.store, self.sync)
+            self.history_win = HistoryWindow(self.store, self.sync, self.theme, self.accent_hex)
+        else:
+            self.history_win.apply_theme(self.theme, self.accent_hex)
         self.history_win.refresh()
+        if tab_index == 2:
+            self.history_win.open_compare()
+        elif isinstance(tab_index, int) and not isinstance(tab_index, bool):
+            self.history_win.tabs.setCurrentIndex(tab_index)
         self.history_win.show()
         self.history_win.raise_()
         self.history_win.activateWindow()
+
+    def open_compare(self):
+        self.open_history(tab_index=2)
+
+    def sync_or_connect(self):
+        if self.sync is not None and self.sync.enabled:
+            self.sync.request()
+        else:
+            self.open_compare()
+            if self.history_win is not None:
+                self.history_win._open_sync_setup()
 
     def _logical(self, pos):
         return QPointF(pos.x() * self.base_w / max(1, self.width()),
@@ -3303,24 +4210,25 @@ class HudWindow(QWidget):
     def _build_context_menu(self):
         self._menu_sync = []
         menu = StayOpenMenu(self, owner=self)
-        menu.setStyleSheet(f"""
-            QMenu {{ background-color: #0c1410; color: #ffffff; border: 1px solid {self.accent_hex}; font-weight: bold; }}
-            QMenu::item {{ padding: 6px 20px; }}
-            QMenu::item:selected {{ background-color: #1b3b26; color: {self.accent_hex}; }}
-        """)
+        menu.setStyleSheet(build_menu_style(self.theme, self.accent_hex))
         if self.sync and self.sync.update_available:
             act_upd = QAction("⬆ Yeni Güncelleme Var — Şimdi Güncelle!", self)
             act_upd.triggered.connect(lambda: apply_app_update(self))
             menu.addAction(act_upd)
             menu.addSeparator()
         act_hist = QAction("📊 Oyun Geçmişi…", self)
-        act_hist.triggered.connect(self.open_history)
+        act_hist.triggered.connect(lambda: self.open_history())
         menu.addAction(act_hist)
+        act_cmp = QAction("⚖️ PC Karşılaştırma…", self)
+        act_cmp.triggered.connect(self.open_compare)
+        menu.addAction(act_cmp)
         act_guide = QAction("📖 Kısayollar ve Kullanım Rehberi…", self)
-        act_guide.triggered.connect(lambda: show_shortcuts_guide(self, self.accent_hex))
+        act_guide.triggered.connect(lambda: show_shortcuts_guide(self, self.accent_hex, self.theme))
         menu.addAction(act_guide)
-        act_sync = QAction("🔄 GitHub ile Senkronize Et / Güncelleme Denetle", self)
-        act_sync.triggered.connect(lambda: self.sync and self.sync.request())
+        act_sync = QAction(
+            "🔄 GitHub ile Senkronize Et / Güncelleme Denetle" if (self.sync and self.sync.enabled)
+            else "🔗 GitHub Kayıt Deposu Bağla…", self)
+        act_sync.triggered.connect(self.sync_or_connect)
         menu.addAction(act_sync)
         menu.addSeparator()
         self._add_color_menu(menu)
@@ -4051,8 +4959,9 @@ class HudWindow(QWidget):
         p.setFont(f_sub_brand)
         if self.sync and self.sync.update_available:
             ur = self.UPDATE_RECT
+            pal = theme_palette(self.theme, self.accent_hex)
             p.setPen(QPen(green, 1.5))
-            p.setBrush(QColor(24, 68, 38) if self.update_hover else QColor(14, 38, 22))
+            p.setBrush(QColor(pal["upd_hover"] if self.update_hover else pal["upd_bg"]))
             p.drawRoundedRect(ur, 6, 6)
             p.setPen(white if self.update_hover else green)
             p.drawText(ur, Qt.AlignmentFlag.AlignCenter, "⬆ GÜNCELLEME VAR — TIKLA VE GÜNCELLE")
