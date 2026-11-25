@@ -37,6 +37,7 @@ say "Bağımlılıklar kontrol ediliyor"
 missing=()
 command -v python3 >/dev/null || missing+=(python)
 python3 -c "import PySide6" 2>/dev/null || missing+=(pyside6)
+python3 -c "import psutil" 2>/dev/null || missing+=(python-psutil)
 command -v mangohud >/dev/null || missing+=(mangohud)
 if command -v pacman >/dev/null; then pacman -Q lib32-mangohud >/dev/null 2>&1 || missing+=(lib32-mangohud); fi
 command -v git >/dev/null || missing+=(git)
