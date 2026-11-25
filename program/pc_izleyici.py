@@ -3039,10 +3039,8 @@ class PCActivityDaemon:
             if dom:
                 d_vis = 1 if dom != self._last_domain else 0
                 self._last_domain = dom
-                if url:
-                    web_title = f"{strip_browser_suffix(title)} · {url}"[:140]
-                else:
-                    web_title = strip_browser_suffix(title)[:140]
+                # Repo aktivite özetine yalnız URL'siz, saf sekme başlığı yazılır.
+                web_title = strip_browser_suffix(title)[:140]
                 self._add_buf(day, "web", dom, "Web", dt, d_vis, web_title, now)
                 self._current_label = f"{app_name} · {dom}"
         else:
@@ -3051,10 +3049,8 @@ class PCActivityDaemon:
         # Film Şeridi: yoklama başına tek birleşik besleme; domain varsa web önceliklidir.
         try:
             if dom:
-                if url:
-                    combined = f"{strip_browser_suffix(title)} · {url}"[:140]
-                else:
-                    combined = strip_browser_suffix(title)[:140]
+                # URL yalnız LAN film şeridi feed'inde görünür; repo buffer'ına taşınmaz.
+                combined = f"{web_title} · {url}"[:140] if url else web_title
                 tl_args = ("web", dom, combined, dom)
             else:
                 tl_args = ("oyun" if is_game else "app", app_name, (title or "")[:140], "")
@@ -3081,7 +3077,7 @@ class PCActivityDaemon:
                         self.store.add_event(
                             "izlenen",
                             f"[{_pat}] {tl_ev.get('name', '')}",
-                            (tl_ev.get("title") or "")[:300],
+                            (web_title if dom else (tl_ev.get("title") or ""))[:300],
                             severity="important",
                             ts=now,
                             event_key=_ev_key,
