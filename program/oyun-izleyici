@@ -2156,8 +2156,10 @@ WIN_IGNORED_EXES = {
     # oyun başlatıcıları (oyunun kendisi değil)
     "steam.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "epicwebhelper.exe", "battle.net.exe",
     "galaxyclient.exe", "riotclientservices.exe", "riotclientux.exe", "ubisoftconnect.exe", "upc.exe",
-    # bu program ve kare yakalama araçları
+    # bu program, geliştirme / terminal / yardımcı araçlar ve kare yakalama araçları
     "python.exe", "pythonw.exe", "presentmon.exe", "msiafterburner.exe", "rtss.exe", "nvcontainer.exe",
+    "powershell.exe", "pwsh.exe", "windowsterminal.exe", "cmd.exe", "antigravity.exe", "opencode.exe",
+    "gcc.exe", "artcraft-launcher.exe", "anydesk.exe", "rustdesk.exe",
 }
 
 
@@ -2216,6 +2218,7 @@ class WinFrameCapture:
         return True
 
     def stop(self):
+        import subprocess
         self._stop = True
         with self.lock:
             self._close_active()
@@ -2224,6 +2227,13 @@ class WinFrameCapture:
                 self.proc.terminate()
         except Exception:
             pass
+        # Çıkışta veya güncellemede çekirdek ETW oturumunun yetim kalmasını önle
+        if os.path.isfile(self.exe):
+            try:
+                subprocess.run([self.exe, "--session_name", self.SESSION_NAME, "--terminate_existing_session"],
+                               capture_output=True, timeout=3, **_hidden())
+            except Exception:
+                pass
 
     def take_error(self):
         """Yeni bir hata oluştuysa metnini bir kez döndürür (bildirim için)."""
@@ -2265,7 +2275,7 @@ class WinFrameCapture:
             return None
         idx = {
             "app": low.index("application"), "pid": low.index("processid"),
-            "ft": None, "ts": None, "gpu_busy": None, "cpu_busy": None,
+            "ft": None, "ts": None, "ts_ms": False, "gpu_busy": None, "cpu_busy": None,
             "disp_lat": None, "pmode": None,
         }
         for key, cands in (
@@ -2279,6 +2289,8 @@ class WinFrameCapture:
             for n in cands:
                 if n in low:
                     idx[key] = low.index(n)
+                    if key == "ts" and n == "cpustarttime":
+                        idx["ts_ms"] = True   # PresentMon v2 CPUStartTime milisaniye cinsindendir
                     break
         return idx
 
@@ -2339,6 +2351,8 @@ class WinFrameCapture:
         try:
             if idx["ts"] is not None:
                 frame_ts = float(parts[idx["ts"]])
+                if idx.get("ts_ms"):
+                    frame_ts /= 1000.0
             if idx["ft"] is not None:
                 ft = float(parts[idx["ft"]])
             elif frame_ts is not None:
