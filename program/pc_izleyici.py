@@ -974,11 +974,37 @@ def get_idle_seconds():
         except Exception:
             pass
         return 0.0
+    # Linux Wayland (KDE Plasma / GNOME) via D-Bus ScreenSaver
+    try:
+        out = subprocess.check_output(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.ScreenSaver",
+             "--object-path", "/org/freedesktop/ScreenSaver",
+             "--method", "org.freedesktop.ScreenSaver.GetSessionIdleTime"],
+            timeout=1, stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace")
+        m = re.search(r"(\d+)", out)
+        if m:
+            return int(m.group(1)) / 1000.0
+    except Exception:
+        pass
     try:
         out = subprocess.check_output(["xprintidle"], timeout=1, stderr=subprocess.DEVNULL).decode().strip()
         return int(out) / 1000.0
     except Exception:
         return 0.0
+
+
+def _linux_proc_from_pid(pid):
+    exe_name, exe_path = "", ""
+    try:
+        exe_path = os.readlink(f"/proc/{pid}/exe")
+        exe_name = os.path.basename(exe_path)
+    except OSError:
+        try:
+            exe_name = open(f"/proc/{pid}/comm").read().strip()
+        except OSError:
+            pass
+    return exe_name, exe_path
 
 
 def get_foreground_info():
@@ -1010,18 +1036,36 @@ def get_foreground_info():
             return pid.value, exe_name, exe_path, title
         except Exception:
             return None, "", "", ""
-    # Linux (X11 xdotool / Hyprland)
+    # Linux 1: Hyprland (Wayland)
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        try:
+            raw = subprocess.check_output(["hyprctl", "activewindow", "-j"], timeout=1, stderr=subprocess.DEVNULL).decode("utf-8", "replace")
+            info = json.loads(raw)
+            pid = int(info.get("pid") or 0)
+            if pid > 0:
+                en, ep = _linux_proc_from_pid(pid)
+                return pid, en or (info.get("class") or ""), ep, info.get("title") or ""
+        except Exception:
+            pass
+    # Linux 2: KDE Plasma Wayland (kdotool)
+    if shutil.which("kdotool"):
+        try:
+            wid = subprocess.check_output(["kdotool", "getactivewindow"], timeout=1, stderr=subprocess.DEVNULL).decode().strip()
+            if wid:
+                pid_s = subprocess.check_output(["kdotool", "getwindowpid", wid], timeout=1, stderr=subprocess.DEVNULL).decode().strip()
+                title = subprocess.check_output(["kdotool", "getwindowname", wid], timeout=1, stderr=subprocess.DEVNULL).decode("utf-8", "replace").strip()
+                pid = int(pid_s)
+                en, ep = _linux_proc_from_pid(pid)
+                return pid, en, ep, title
+        except Exception:
+            pass
+    # Linux 3: X11 / XWayland (xdotool)
     try:
         wid = subprocess.check_output(["xdotool", "getactivewindow"], timeout=1, stderr=subprocess.DEVNULL).decode().strip()
         pid = int(subprocess.check_output(["xdotool", "getwindowpid", wid], timeout=1, stderr=subprocess.DEVNULL).decode().strip())
         title = subprocess.check_output(["xdotool", "getwindowname", wid], timeout=1, stderr=subprocess.DEVNULL).decode("utf-8", "replace").strip()
-        exe_name, exe_path = "", ""
-        try:
-            exe_path = os.readlink(f"/proc/{pid}/exe")
-            exe_name = os.path.basename(exe_path)
-        except OSError:
-            pass
-        return pid, exe_name, exe_path, title
+        en, ep = _linux_proc_from_pid(pid)
+        return pid, en, ep, title
     except Exception:
         return None, "", "", ""
 
@@ -2596,8 +2640,8 @@ class PCActivityDaemon:
         else:
             self._last_domain = None
 
-        # Oyun algılama → otomatik HUD
-        if is_game:
+        # Oyun algılama → otomatik HUD (Windows süreç/klasör + Linux MangoHud canlı log)
+        if is_game or (not IS_WIN and self._linux_mangohud_active()):
             self._last_game_seen_ts = now
             if self.cfg.get("hud_oto", "acik") != "kapali" and not self.is_hud_running():
                 self.ensure_hud_running(auto=True)
@@ -2615,7 +2659,21 @@ class PCActivityDaemon:
                 else:
                     self._last_game_seen_ts = now - HUD_IDLE_GRACE_SEC + 15.0
 
+    def _linux_mangohud_active(self):
+        if IS_WIN or not os.path.isdir(MANGOHUD_DIR):
+            return False
+        now = time.time()
+        try:
+            for p in glob.glob(os.path.join(MANGOHUD_DIR, "*.csv")):
+                if now - os.path.getmtime(p) <= 6.0:
+                    return True
+        except OSError:
+            pass
+        return False
+
     def _any_game_process_running(self):
+        if not IS_WIN and self._linux_mangohud_active():
+            return True
         if not psutil:
             return False
         for proc in psutil.process_iter(["name"]):
