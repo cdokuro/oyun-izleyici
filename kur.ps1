@@ -242,6 +242,15 @@ if ($KayitDeposu) {
 }
 
 # ---- 9. Baslat ---------------------------------------------------------------------
+if ($env:OI_KOMUTA_URL) {
+    $kConf = Join-Path $Roam "makine.conf"
+    $kLines = if (Test-Path $kConf) { Get-Content $kConf } else { @() }
+    $kLines = @($kLines | Where-Object { $_ -notmatch '^\s*komuta_url\s*=' }) + ("komuta_url = " + $env:OI_KOMUTA_URL)
+    Set-Content -Path $kConf -Value $kLines -Encoding UTF8
+}
+if ($env:OI_KOMUTA_KEY) {
+    Set-Content -Path (Join-Path $Roam "komuta.key") -Value $env:OI_KOMUTA_KEY -Encoding UTF8 -NoNewline
+}
 Say "Oyun Izleyici baslatiliyor"
 Start-Process -FilePath $VenvPyW -ArgumentList ('"' + $AppFile + '"') -WorkingDirectory $Data
 
