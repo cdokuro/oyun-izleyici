@@ -38,7 +38,19 @@ else:
 _UI_FLAGS = {"--hud", "--dashboard", "--rapor", "--sync", "--tani", "--snapshot", "--eski", "--auto-hud"}
 if __name__ == "__main__" and not (set(sys.argv[1:]) & _UI_FLAGS):
     _app_dir = os.path.dirname(os.path.abspath(__file__))
-    if os.path.isfile(os.path.join(_app_dir, "pc_izleyici.py")):
+    _daemon_local = os.path.join(_app_dir, "pc_izleyici.py")
+    if not os.path.isfile(_daemon_local):
+        # v3 -> v4 tek tık yükseltmede pc_izleyici.py henüz kopyalanmadıysa yerel depodan tamamla
+        _data_d = (os.path.join(_LOCAL, "oyun-izleyici") if IS_WIN
+                   else os.path.join(os.path.expanduser("~"), ".local", "share", "oyun-izleyici"))
+        _repo_daemon = os.path.join(_data_d, "depo", "program", "pc_izleyici.py")
+        if os.path.isfile(_repo_daemon):
+            try:
+                import shutil as _shutil
+                _shutil.copy2(_repo_daemon, _daemon_local)
+            except OSError:
+                pass
+    if os.path.isfile(_daemon_local):
         if _app_dir not in sys.path:
             sys.path.insert(0, _app_dir)
         try:
@@ -3972,6 +3984,8 @@ class HistoryWindow(QWidget):
         self.res_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
         btns = QHBoxLayout()
+        b_hud = QPushButton("🎮 Canlı HUD")
+        b_hud.clicked.connect(self._launch_hud)
         b_md = QPushButton("📄 Özet Raporu (.md)")
         b_md.clicked.connect(self._export_markdown)
         b_del = QPushButton("Seçili Oturumu Sil")
@@ -3995,7 +4009,7 @@ class HistoryWindow(QWidget):
         b_help.clicked.connect(lambda: show_shortcuts_guide(self, self.accent_hex, self.theme))
         b_ref = QPushButton("Yenile")
         b_ref.clicked.connect(self.refresh)
-        for b in (b_md, b_del, b_csv, b_bak, self.b_sync, self.b_repo, self.b_upd, b_dir, b_help):
+        for b in (b_hud, b_md, b_del, b_csv, b_bak, self.b_sync, self.b_repo, self.b_upd, b_dir, b_help):
             btns.addWidget(b)
         btns.addStretch(1)
         btns.addWidget(b_ref)
@@ -4544,6 +4558,18 @@ class HistoryWindow(QWidget):
                 I(e["detail"] or "", e["detail"] or "", align_right=False),
             ])
         self._fill_table(self.evt_tbl, rows, (0, Qt.SortOrder.DescendingOrder))
+
+    def _launch_hud(self):
+        import subprocess
+        py = sys.executable
+        if IS_WIN and py.lower().endswith("python.exe"):
+            pyw = py[:-10] + "pythonw.exe"
+            if os.path.isfile(pyw):
+                py = pyw
+        try:
+            subprocess.Popen([py, os.path.abspath(__file__), "--hud"], close_fds=True, **_hidden())
+        except Exception:
+            pass
 
     def _export_markdown(self):
         from PySide6.QtWidgets import QFileDialog, QMessageBox
