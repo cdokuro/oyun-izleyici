@@ -100,6 +100,7 @@ if [[ -f "$HOME/.local/bin/oyun-izleyici" ]] && ! cmp -s "$SRC/program/oyun-izle
     cp -p "$HOME/.local/bin/oyun-izleyici" "$HOME/.local/bin/oyun-izleyici.yedek-$TS"
 fi
 install -m 755 "$SRC/program/oyun-izleyici" "$HOME/.local/bin/oyun-izleyici"
+if [[ -f "$SRC/program/pc_izleyici.py" ]]; then install -m 644 "$SRC/program/pc_izleyici.py" "$HOME/.local/bin/pc_izleyici.py"; fi
 
 # PC adı (sadece ilk kurulumda; sonra makine.conf'tan değiştirilebilir)
 if [[ -n "$PC_ADI" && ! -f "$CONF_DIR/makine.conf" ]]; then
