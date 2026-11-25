@@ -1865,6 +1865,27 @@ class DaemonSync:
         q = urllib.parse.quote(rel, safe="/")
         github_api_request("PUT", f"https://api.github.com/repos/{slug}/contents/{q}", token=token, body=payload)
 
+    def _git_cmd(self, git_exe, *args, timeout=90):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        if not IS_WIN:
+            env.update(GIT_ASKPASS="true", SSH_ASKPASS="true")
+        p = subprocess.run([git_exe, "-C", REPO_DIR, *args], capture_output=True, text=True,
+                           timeout=timeout, env=env, **_hidden())
+        if p.returncode != 0:
+            msg = (p.stderr or p.stdout or "").strip()
+            raise RuntimeError(msg.splitlines()[-1] if msg else f"git {args[0]} başarısız")
+        return p.stdout
+
+    def _find_git(self):
+        g = shutil.which("git")
+        if g:
+            return g
+        if IS_WIN:
+            for c in (r"C:\Program Files\Git\cmd\git.exe", r"C:\Program Files (x86)\Git\cmd\git.exe"):
+                if os.path.isfile(c):
+                    return c
+        return None
+
     def maybe_sync(self, force=False):
         if self._busy:
             return
@@ -1873,7 +1894,8 @@ class DaemonSync:
         self.cfg = load_machine_config()
         slug = normalize_repo_slug(self.cfg.get("kayit_deposu", ""))
         token = read_github_token()
-        if self.cfg.get("senkron", "acik") == "kapali" or not slug:
+        git_exe = self._find_git() if os.path.isdir(os.path.join(REPO_DIR, ".git")) else None
+        if self.cfg.get("senkron", "acik") == "kapali" or (not slug and not git_exe):
             self._next_at = time.time() + SYNC_INTERVAL_SEC
             return
         self._next_at = time.time() + SYNC_INTERVAL_SEC
@@ -1886,11 +1908,69 @@ class DaemonSync:
         self.store.changed_since_sync = False
 
         self._busy = True
-        threading.Thread(
-            target=self._worker,
-            args=(slug, token, bundle_txt, events_txt),
-            daemon=True,
-        ).start()
+        if git_exe:
+            threading.Thread(target=self._git_worker, args=(git_exe,), daemon=True).start()
+        else:
+            threading.Thread(
+                target=self._worker,
+                args=(slug, token, bundle_txt, events_txt),
+                daemon=True,
+            ).start()
+
+    def _git_worker(self, git_exe):
+        """Linux/Windows Git+SSH deploy key deposu olan PC'ler için otomatik senkron."""
+        remote_imports = []
+        try:
+            rel = os.path.join("makineler", self.mid)
+            self._git_cmd(git_exe, "add", "--", rel)
+            if self._git_cmd(git_exe, "status", "--porcelain", "--", rel).strip():
+                self._git_cmd(
+                    git_exe,
+                    "-c", f"user.name=oyun-izleyici ({self.mid})",
+                    "-c", f"user.email={self.mid}@oyun-izleyici.local",
+                    "commit", "-q", "-m", f"{self.cfg.get('ad') or self.mid}: aktivite ve olaylar güncellendi",
+                )
+            self._git_cmd(git_exe, "pull", "-q", "--rebase", "--autostash")
+            ahead = self._git_cmd(git_exe, "rev-list", "--count", "@{u}..HEAD").strip()
+            if ahead and ahead != "0":
+                self._git_cmd(git_exe, "push", "-q")
+
+            base = os.path.join(REPO_DIR, "makineler")
+            for d in sorted(glob.glob(os.path.join(base, "*"))):
+                mid = os.path.basename(d)
+                if mid == self.mid or not os.path.isdir(d):
+                    continue
+                bundle_obj, evt_rows = None, []
+                bp = os.path.join(d, "aktivite_ozet.json")
+                if os.path.isfile(bp):
+                    try:
+                        bundle_obj = json.loads(open(bp, encoding="utf-8").read())
+                    except Exception:
+                        pass
+                ep = os.path.join(d, "olaylar.jsonl")
+                if os.path.isfile(ep):
+                    try:
+                        for ln in open(ep, encoding="utf-8"):
+                            if ln.strip():
+                                evt_rows.append(json.loads(ln))
+                    except Exception:
+                        pass
+                remote_imports.append((mid, bundle_obj, evt_rows))
+
+            prog_p = os.path.join(REPO_DIR, "program", "oyun-izleyici")
+            if os.path.isfile(prog_p):
+                try:
+                    self._check_ver(open(prog_p, encoding="utf-8", errors="ignore").read(4096))
+                except OSError:
+                    pass
+
+            self._pending_imports = remote_imports
+            self.last_ok = time.time()
+            self.last_error = None
+        except Exception as e:
+            self.last_error = str(e)
+        finally:
+            self._busy = False
 
     def _worker(self, slug, token, bundle_txt, events_txt):
         remote_imports = []
