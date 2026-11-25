@@ -6062,12 +6062,21 @@ _NOTIFY_TRAY = None
 
 
 def notify(title, body):
+    import json
     import subprocess
     if IS_WIN:
         try:
             if _NOTIFY_TRAY is not None:
                 from PySide6.QtWidgets import QSystemTrayIcon
                 _NOTIFY_TRAY.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 9000)
+                return
+            # Hafif arka plan modu (--hud): bildirimi tepsiye sahip pc_izleyici servisine ilet
+            os.makedirs(DATA_DIR, exist_ok=True)
+            nf = os.path.join(DATA_DIR, ".notify.json")
+            tmp = nf + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"title": title, "body": body, "ts": time.time()}, f, ensure_ascii=False)
+            os.replace(tmp, nf)
         except Exception:
             pass
         return
