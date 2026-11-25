@@ -3960,7 +3960,9 @@ class HudWindow(QWidget):
         self.save_settings()
 
     def _apply_window_flags(self):
-        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        # Sistem tepsisi varsa Tool bayrağı ile görev çubuğundan ve Alt+Tab'dan gizle (sadece tray'de görünür)
+        base = Qt.WindowType.Tool if self.tray is not None else Qt.WindowType.Window
+        flags = base | Qt.WindowType.FramelessWindowHint
         if self.always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
