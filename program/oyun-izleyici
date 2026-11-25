@@ -18,7 +18,7 @@ import time
 import math
 from collections import deque
 
-APP_VERSION = "4.1.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.3.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
@@ -3790,7 +3790,7 @@ class HistoryWindow(QWidget):
             self._act_store = _pci_mod.ActivityStore(self.store.machine_id, path=self.store.path)
         except Exception:
             self._act_store = None
-        self.setWindowTitle("Oyun & PC İzleyici — Aktivite, Özet ve Oyun Raporu")
+        self.setWindowTitle("Meraklısına Veriler")
         self.resize(1320, 760)
 
         root = QVBoxLayout(self)
@@ -3798,7 +3798,7 @@ class HistoryWindow(QWidget):
         root.setSpacing(10)
 
         top = QHBoxLayout()
-        title = QLabel("OYUN & PC İZLEYİCİ")
+        title = QLabel("MERAKLISINA VERİLER")
         title.setObjectName("title")
         top.addWidget(title)
         top.addSpacing(18)
@@ -4075,7 +4075,7 @@ class HistoryWindow(QWidget):
         btns = QHBoxLayout()
         b_hud = QPushButton("🎮 Canlı HUD")
         b_hud.clicked.connect(self._launch_hud)
-        b_md = QPushButton("📄 Özet Raporu (.md)")
+        b_md = QPushButton("📄 Meraklısına Veriler (.md)")
         b_md.clicked.connect(self._export_markdown)
         b_del = QPushButton("Seçili Oturumu Sil")
         b_del.setObjectName("danger")
@@ -4665,12 +4665,12 @@ class HistoryWindow(QWidget):
         if self._act_store is None or self._pci is None:
             return
         default = os.path.join(os.path.expanduser("~"), time.strftime("pc-aktivite-raporu-%Y-%m-%d.md"))
-        path, _ = QFileDialog.getSaveFileName(self, "Özet Raporunu Kaydet (.md)", default, "Markdown (*.md)")
+        path, _ = QFileDialog.getSaveFileName(self, "Meraklısına Verileri Kaydet (.md)", default, "Markdown (*.md)")
         if path:
             md = self._pci.SummaryEngine.to_markdown(self._act_store, machine=self._machine(), days=self._period_days())
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(md)
-            QMessageBox.information(self, "Rapor Kaydedildi", f"Özet raporu kaydedildi:\n{path}")
+            QMessageBox.information(self, "Kaydedildi", f"Meraklısına verileri kaydedildi:\n{path}")
 
     def closeEvent(self, event):
         if self._act_store is not None:
@@ -4764,7 +4764,7 @@ def show_shortcuts_guide(parent=None, accent_hex="#40ff70", theme="klasik"):
     p = theme_palette(theme, accent_hex)
     acc = p["accent"]
     dlg = QDialog(parent)
-    dlg.setWindowTitle("Kısayollar ve Kullanım Rehberi — Oyun İzleyici")
+    dlg.setWindowTitle("Kısayollar ve Kullanım Rehberi")
     dlg.resize(560, 540)
     dlg.setStyleSheet(f"""
         QDialog {{ background-color: {p['bg']}; color: {p['text']}; font-family: 'Noto Sans', 'Segoe UI', Arial, sans-serif; }}
