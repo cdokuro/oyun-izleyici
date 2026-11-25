@@ -18,6 +18,8 @@ import time
 import math
 from collections import deque
 
+APP_VERSION = "3.0.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
     import msvcrt
@@ -933,7 +935,8 @@ class SyncManager:
         self.last_ok = None
         self.last_error = None
         self.update_available = False
-        self._notified_update_hash = None
+        self.remote_version = None
+        self._notified_update_ver = None
         self._thread = None
         self._result = None
         self._again = False
@@ -995,27 +998,41 @@ class SyncManager:
         self.last_error = None
         self.state = "kapalı"
 
+    @staticmethod
+    def _parse_version(text):
+        """Kaynak dosyadaki APP_VERSION = 'X.Y.Z' değerini (X, Y, Z) demeti olarak okur."""
+        m = re.search(r'^APP_VERSION\s*=\s*["\'](\d+)\.(\d+)\.(\d+)["\']', text, re.M)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
     def check_app_update(self):
-        """Depodaki program/oyun-izleyici ile kurulu ~/.local/bin/oyun-izleyici farklı mı kontrol eder."""
-        import hashlib
+        """Güncelleme rozetini yalnızca depodaki MAJOR veya MINOR sürüm (ör. 3.0 -> 3.1 / 4.0)
+        kurulu sürümden büyükse gösterir; küçük yama veya yerel farklarda asla çıkmaz."""
         repo_bin = os.path.join(REPO_DIR, "program", "oyun-izleyici")
-        inst_bin = INSTALLED_BIN
-        if not (os.path.isfile(repo_bin) and os.path.isfile(inst_bin)):
+        if not os.path.isfile(repo_bin):
             self.update_available = False
+            self.remote_version = None
             return False
         try:
-            with open(repo_bin, "rb") as f1, open(inst_bin, "rb") as f2:
-                h1 = hashlib.sha256(f1.read()).hexdigest()
-                h2 = hashlib.sha256(f2.read()).hexdigest()
-            self.update_available = (h1 != h2)
-            if self.update_available and self._notified_update_hash != h1:
-                self._notified_update_hash = h1
-                notify("Oyun İzleyici — Güncelleme Mevcut!",
-                       "GitHub'dan yeni bir uygulama sürümü indirildi. "
+            with open(repo_bin, "r", encoding="utf-8", errors="ignore") as f:
+                head = f.read(4096)
+            rem = self._parse_version(head)
+            loc = self._parse_version(f'APP_VERSION = "{APP_VERSION}"') or (0, 0, 0)
+            if rem is None or rem[:2] <= loc[:2]:
+                self.update_available = False
+                self.remote_version = None
+                return False
+            ver_str = f"{rem[0]}.{rem[1]}.{rem[2]}"
+            self.update_available = True
+            self.remote_version = ver_str
+            if self._notified_update_ver != ver_str:
+                self._notified_update_ver = ver_str
+                notify(f"Oyun İzleyici — Yeni Sürüm v{ver_str}!",
+                       "GitHub'dan büyük bir uygulama güncellemesi indirildi. "
                        "Paneldeki 'GÜNCELLE' rozetine veya sağ tık menüsündeki 'Uygulamayı Şimdi Güncelle'ye tıklayın.")
-            return self.update_available
+            return True
         except OSError:
             self.update_available = False
+            self.remote_version = None
             return False
 
     # --- ana iş parçacığı ---
@@ -5613,7 +5630,8 @@ class HudWindow(QWidget):
             p.setBrush(QColor(pal["upd_hover"] if self.update_hover else pal["upd_bg"]))
             p.drawRoundedRect(ur, 6, 6)
             p.setPen(white if self.update_hover else green)
-            p.drawText(ur, Qt.AlignmentFlag.AlignCenter, "⬆ GÜNCELLEME VAR — TIKLA VE GÜNCELLE")
+            vtag = f"v{self.sync.remote_version} " if getattr(self.sync, "remote_version", None) else ""
+            p.drawText(ur, Qt.AlignmentFlag.AlignCenter, f"⬆ {vtag}GÜNCELLEME VAR — TIKLA VE GÜNCELLE")
         else:
             p.setPen(green)
             if sm:
