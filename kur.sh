@@ -43,10 +43,53 @@ if command -v pacman >/dev/null; then pacman -Q lib32-mangohud >/dev/null 2>&1 |
 command -v git >/dev/null || missing+=(git)
 command -v lspci >/dev/null || missing+=(pciutils)
 command -v notify-send >/dev/null || missing+=(libnotify)
-if ((${#missing[@]})); then
-    die "Eksik paketler: ${missing[*]}
-    Arch/CachyOS:  sudo pacman -S --needed ${missing[*]}   (diğer dağıtımlarda karşılıklarını kur)
-    Sonra bu betiği tekrar çalıştır."
+opt_missing=()
+if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    if [[ -n "${WAYLAND_DISPLAY:-}" && "${XDG_CURRENT_DESKTOP,,}" == *kde* ]]; then
+        command -v kdotool >/dev/null || opt_missing+=(kdotool)
+    else
+        command -v xdotool >/dev/null || opt_missing+=(xdotool)
+    fi
+fi
+if ((${#missing[@]} || ${#opt_missing[@]})); then
+    warn "Eksik bağımlılıklar tespit edildi:"
+    ((${#missing[@]})) && echo "   • Gerekli : ${missing[*]}"
+    ((${#opt_missing[@]})) && echo "   • Önerilen (pencere/web takibi): ${opt_missing[*]}"
+    echo
+    ans=""
+    if [[ -t 0 ]]; then
+        read -rp "Bağımlılıklar için kurulum komutları gösterilip kurulsun mu? [E/h]: " ans
+    fi
+    pac_list=("${missing[@]}")
+    aur_list=()
+    for op in "${opt_missing[@]}"; do
+        if [[ "$op" == "kdotool" ]]; then aur_list+=(kdotool); else pac_list+=("$op"); fi
+    done
+    echo
+    echo "Kurulum komutları:"
+    ((${#pac_list[@]})) && echo "   sudo pacman -S --needed ${pac_list[*]}"
+    if ((${#aur_list[@]})); then
+        if command -v paru >/dev/null; then
+            echo "   paru -S --needed ${aur_list[*]}"
+        else
+            echo "   yay -S --needed ${aur_list[*]}"
+        fi
+    fi
+    echo
+    if [[ "${ans,,}" =~ ^(e|evet|y|yes|)$ && -t 0 ]]; then
+        if ((${#pac_list[@]})) && command -v pacman >/dev/null; then
+            sudo pacman -S --needed "${pac_list[@]}" || true
+        fi
+        if ((${#aur_list[@]})); then
+            if command -v paru >/dev/null; then
+                paru -S --needed "${aur_list[@]}" || true
+            elif command -v yay >/dev/null; then
+                yay -S --needed "${aur_list[@]}" || true
+            fi
+        fi
+    elif ((${#missing[@]})); then
+        die "Gerekli paketleri yukarıdaki komutla kurup betiği tekrar çalıştır."
+    fi
 fi
 
 [[ -f "$SRC/program/oyun-izleyici" ]] || die "program/oyun-izleyici bulunamadı ($SRC)"
