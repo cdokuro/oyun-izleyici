@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PC & Oyun İzleyici — Hafif Arka Plan Servisi (v4.0.0)
+PC & Oyun İzleyici — Hafif Arka Plan Servisi (v4.3.0)
 
 PySide6 / Qt YÜKLEMEZ! Yalnızca standart kütüphane + psutil + SQLite + Win32/Linux
 yerel çağrılarıyla ~20-25 MB RAM bandında 7/24 sessizce çalışır:
@@ -17,6 +17,7 @@ yerel çağrılarıyla ~20-25 MB RAM bandında 7/24 sessizce çalışır:
 
 import base64
 import ctypes
+import getpass
 import glob
 import hashlib
 import json
@@ -35,7 +36,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.3.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 IS_WIN = sys.platform.startswith("win")
 
 if IS_WIN:
@@ -341,7 +342,7 @@ class KomutaPusher:
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def send_ingest(self):
+    def send_ingest(self, timeline_events=None):
         if self._busy_ing:
             return
         url, key, _cfg = self._endpoint()
@@ -351,17 +352,25 @@ class KomutaPusher:
         evts = [
             json.loads(ln) for ln in self.store.export_events_lines().splitlines() if ln.strip()
         ]
+        tl = (timeline_events or [])[:500]
         payload = {
             "machine_id": self.mid,
             "activity": bundle.get("activity") or [],
             "resources": bundle.get("resources") or [],
             "events": evts[-250:],
+            "timeline": tl,
         }
         self._busy_ing = True
 
         def _work():
             try:
                 self._post(f"{url}/ingest", key, payload, timeout=15)
+                # Başarılı gönderim sonrası watermark'ı kaydır
+                if tl:
+                    try:
+                        self.store.set_timeline_watermark(tl[-1]["event_id"])
+                    except Exception:
+                        pass
             except Exception:
                 pass
             finally:
@@ -377,7 +386,7 @@ def fmt_duration_tr(sec, short=False):
     if h >= 1:
         return f"{h} sa {m} dk" if m else f"{h} sa"
     if m >= 1:
-        return f"{m} dk" if short else (f"{m} dk {s} sn" if m < 5 and s else f"{m} dk")
+        return f"{m} dk" if short else (f"{m} dk {s} sn" if s else f"{m} dk")
     return f"{s} sn"
 
 
@@ -629,6 +638,70 @@ def strip_browser_suffix(title):
 
 
 # =============================================================================
+# TIMELINE COLLECTOR — Film Şeridi olay filtresi (saf mantık, I/O'suz)
+# =============================================================================
+class TimelineCollector:
+    """Ön plan değişimlerini olay kaydına yazıp yazmayacağına karar veren saf sınıf.
+
+    Kurallar (feed):
+      (a) `name` değişti → hemen kaydet (günlük kap dolu olsa bile).
+      (b) Aynı `name`, başlık değişti ama son olaydan < title_min_gap_sec geçti → None.
+      (c) kind=="web" ve `domain` değişti → gap'e rağmen kaydet (kap dolu değilse).
+      (d) Günlük sayaç daily_cap dolmuşsa o gün için yalnız (a) kaydedilir.
+    Dönen olay: {"ts", "os_user", "kind", "name", "title"}; kaydedilmeyecekse None.
+    """
+
+    def __init__(self, daily_cap=1000, title_min_gap_sec=10.0, idle_marker_sec=300.0):
+        self.daily_cap = daily_cap
+        self.title_min_gap_sec = title_min_gap_sec
+        self.idle_marker_sec = idle_marker_sec
+        self._last = None        # son kaydedilen: (name, title, domain, ts)
+        self._day = None         # günlük sayaç anahtarı: "YYYY-MM-DD" (time.localtime)
+        self._count = 0          # Süreç-bazlı sınır: yeniden başlatmada sıfırlanır; DB'den yüklenmez (bilinçli).
+        self._idle_active = False
+        self._idle_peak = 0.0
+
+    def _day_key(self, ts):
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+    def feed(self, ts, os_user, kind, name, title, domain=""):
+        day = self._day_key(ts)
+        if day != self._day:
+            self._day = day
+            self._count = 0
+        if self._last is not None:
+            last_name, last_title, last_domain, last_ts = self._last
+            if name != last_name:                       # (a) uygulama değişimi — her koşulda
+                pass
+            elif self._count >= self.daily_cap:         # (d) kap dolu → yalnız (a)
+                return None
+            elif kind == "web" and domain != last_domain:  # (c) domain değişimi
+                pass
+            elif title == last_title:                   # değişim yok
+                return None
+            elif ts - last_ts < self.title_min_gap_sec:  # (b) başlık throttle
+                return None
+        event = {"ts": ts, "os_user": os_user, "kind": kind, "name": name, "title": title}
+        self._last = (name, title, domain, ts)
+        self._count += 1
+        return event
+
+    def poll_idle(self, ts, os_user, idle_sec):
+        """Bekleme süresince durumu izler; yalnız dönüş kenarında tek olay üretir."""
+        if idle_sec is not None and idle_sec >= self.idle_marker_sec:
+            self._idle_active = True
+            self._idle_peak = max(self._idle_peak, idle_sec)
+            return None
+        if not self._idle_active:
+            return None
+        peak = self._idle_peak
+        self._idle_active = False
+        self._idle_peak = 0.0
+        return {"kind": "sistem", "name": "beklemede",
+                "title": f"{fmt_duration_tr(peak)} boyunca beklemede"}
+
+
+# =============================================================================
 # VERİTABANI KATMANI — SQLite v4 (v3 oturum tablolarıyla %100 geriye uyumlu)
 # =============================================================================
 class ActivityStore:
@@ -708,6 +781,20 @@ class ActivityStore:
                     scope TEXT PRIMARY KEY,
                     updated_ts REAL NOT NULL,
                     payload TEXT NOT NULL
+                )""")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS timeline_events (
+                    ts REAL NOT NULL,
+                    os_user TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    title TEXT NOT NULL
+                )""")
+            self.db.execute("CREATE INDEX IF NOT EXISTS idx_tl_ts ON timeline_events(ts)")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS timeline_watermark (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    ts REAL NOT NULL
                 )""")
             ver = self.db.execute("PRAGMA user_version").fetchone()[0]
             if ver < 4:
@@ -897,6 +984,52 @@ class ActivityStore:
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (mid, float(r.get("ts", 0)), r.get("kind", "sistem"),
                       r.get("severity", "info"), r.get("title", ""), r.get("detail", ""), ek))
+
+    # --- Timeline (Film Şeridi) ---
+    def add_timeline_event(self, ts, os_user, kind, name, title):
+        """Film Şeridi: ön plan değişim olayını timeline_events tablosuna yazar."""
+        with self.db:
+            self.db.execute(
+                "INSERT INTO timeline_events(ts, os_user, kind, name, title) VALUES (?,?,?,?,?)",
+                (float(ts), str(os_user or ""), str(kind or ""), str(name or ""), str(title or ""))
+            )
+
+    def fetch_timeline_since(self, since_rowid, limit=500):
+        """Son gönderilen rowid'den sonraki olayları deterministik sırayla döner."""
+        rows = self.db.execute(
+            "SELECT rowid AS event_id, ts, os_user, kind, name, title FROM timeline_events "
+            "WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+            (int(since_rowid), int(limit))
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_timeline(self, keep_days=30):
+        """keep_days günden eski timeline olaylarını siler; silinen satır sayısını döner."""
+        cutoff = time.time() - float(keep_days) * 86400.0
+        with self.db:
+            cur = self.db.execute("DELETE FROM timeline_events WHERE ts < ?", (cutoff,))
+        return cur.rowcount
+
+    def get_timeline_watermark(self):
+        """Son başarıyla gönderilen timeline olayının rowid'si (başlangıçta 0)."""
+        row = self.db.execute("SELECT ts FROM timeline_watermark WHERE id=1").fetchone()
+        return int(row[0]) if row else 0
+
+    def set_timeline_watermark(self, event_id):
+        """Başarılı ingest sonrası watermark'ı günceller.
+
+        Thread-safe: send_ingest'in arka plan thread'inden çağrılır; kendi kısa
+        ömürlü bağlantısını açar (check_same_thread sorununu önler).
+        """
+        conn = sqlite3.connect(self.path, timeout=5)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO timeline_watermark(id, ts) VALUES (1, ?)",
+                (int(event_id),)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     # --- Okuma / Analitik Sorguları (Dashboard & SummaryEngine) ---
     def _where_day(self, machine=None, days=7):
@@ -1283,7 +1416,7 @@ class BrowserDomainResolver:
     """Chrome / Edge / Brave / Opera / Vivaldi / Firefox / Zen geçmişinden domain eşleştirir."""
 
     def __init__(self):
-        self.title_to_domain = {}  # normalized_title -> (domain, ts)
+        self.title_to_domain = {}  # normalized_title -> (domain, ts, url)
         self._last_scan = 0.0
         self._seen_visit_max = {}
 
@@ -1355,7 +1488,7 @@ class BrowserDomainResolver:
                             dom = clean_domain(url)
                             if not dom:
                                 continue
-                            self._accum(dom, title or "", ts, title_map, day_counts)
+                            self._accum(dom, title or "", ts, title_map, day_counts, url)
                     else:
                         # Firefox/Zen time: microseconds since 1970-01-01
                         cut_ff = int(cutoff_unix * 1_000_000)
@@ -1370,7 +1503,7 @@ class BrowserDomainResolver:
                             dom = clean_domain(url)
                             if not dom:
                                 continue
-                            self._accum(dom, title or "", ts, title_map, day_counts)
+                            self._accum(dom, title or "", ts, title_map, day_counts, url)
                 finally:
                     conn.close()
             except Exception:
@@ -1390,10 +1523,10 @@ class BrowserDomainResolver:
             store.record_web_visits({k: (v[0], v[1], v[2]) for k, v in day_counts.items()})
 
     @staticmethod
-    def _accum(dom, title, ts, title_map, day_counts):
+    def _accum(dom, title, ts, title_map, day_counts, url=""):
         norm = strip_browser_suffix(title).lower()[:80]
         if norm and (norm not in title_map or ts > title_map[norm][1]):
-            title_map[norm] = (dom, ts)
+            title_map[norm] = (dom, ts, url)
         day = today_str(ts)
         key = (day, dom)
         if key not in day_counts:
@@ -1416,7 +1549,7 @@ class BrowserDomainResolver:
             return self.title_to_domain[low][0]
         if len(low) >= 12:
             prefix = low[:28]
-            for k, (dom, _ts) in self.title_to_domain.items():
+            for k, (dom, _ts, *_rest) in self.title_to_domain.items():
                 if k.startswith(prefix) or low.startswith(k[:28]):
                     return dom
         # 2) Bilinen site desenleri
@@ -1431,6 +1564,34 @@ class BrowserDomainResolver:
                 d = d[4:]
             return d
         return ""
+
+    def resolve_title_url(self, raw_title):
+        """Tarayıcı sekme başlığından (domain, url) çifti bulur; bulamazsa None."""
+        clean = strip_browser_suffix(raw_title)
+        low = clean.lower()[:80]
+        if not low or low in ("new tab", "yeni sekme", "start page", "başlangıç sayfası", "about:blank"):
+            return None
+        # 1) Birebir veya önek eşleşmesi (gerçek tarayıcı geçmişinden)
+        if low in self.title_to_domain:
+            dom, _ts, url = self.title_to_domain[low]
+            return (dom, url)
+        if len(low) >= 12:
+            prefix = low[:28]
+            for k, (dom, _ts, url) in self.title_to_domain.items():
+                if k.startswith(prefix) or low.startswith(k[:28]):
+                    return (dom, url)
+        # 2) Bilinen site desenleri (URL bilinmiyor)
+        for pat, dom in SITE_TITLE_PATTERNS:
+            if pat.search(clean):
+                return (dom, "")
+        # 3) Başlık içinde doğrudan alan adı geçiyorsa
+        m = DOMAIN_IN_TITLE_RE.search(clean)
+        if m:
+            d = m.group(1).lower()
+            if d.startswith("www."):
+                d = d[4:]
+            return (d, "")
+        return None
 
 
 # =============================================================================
@@ -2574,7 +2735,7 @@ if IS_WIN:
             always_on = cfg.get("hud_hep_acik", "kapali") == "acik"
             ram_mb = self.daemon.self_ram_mb()
 
-            self._u32.AppendMenuW(menu, MF_STRING, self.CMD_DASHBOARD, "📊 PC Aktivite && Oyun Raporu…")
+            self._u32.AppendMenuW(menu, MF_STRING, self.CMD_DASHBOARD, "Meraklısına Veriler")
             self._u32.SetMenuDefaultItem(menu, self.CMD_DASHBOARD, 0)
             self._u32.AppendMenuW(menu, MF_STRING, self.CMD_WEB_KOMUTA, "🌐 Web Komuta Merkezi (serhatbahar.com/komuta)")
             self._u32.AppendMenuW(
@@ -2693,6 +2854,16 @@ class PCActivityDaemon:
         self.komuta = KomutaPusher(self.store, self.cfg)
         self.tray = WinTrayController(self) if IS_WIN else None
         self.stop_requested = False
+
+        # OS kullanıcı adı (bir kez; timeline olayları için)
+        try:
+            self._os_user = getpass.getuser()
+        except Exception:
+            self._os_user = "bilinmiyor"
+
+        # Film Şeridi: TimelineCollector ve saatlik prune zamanlayıcısı
+        self._collector = TimelineCollector()
+        self._next_prune_hour = time.time() + 3600.0
 
         # Bellek içi tampon (her 30 sn'de SQLite'a tek işlemde yazılır)
         self._buf_act = {}  # (day, kind, name) -> [cat, secs, visits, title, ts]
@@ -2830,6 +3001,15 @@ class PCActivityDaemon:
         day = today_str(now)
 
         idle = get_idle_seconds()
+        # Film Şeridi: her yoklamada kenarı izle; yalnız uzun beklemeden dönüşte yaz.
+        try:
+            idle_ev = self._collector.poll_idle(now, self._os_user, idle)
+            if idle_ev:
+                self.store.add_timeline_event(
+                    now, self._os_user, idle_ev["kind"], idle_ev["name"], idle_ev["title"]
+                )
+        except Exception:
+            pass
         if idle >= IDLE_THRESHOLD_SEC:
             self._add_buf(day, "idle", "Boşta", "Boşta", dt, 0, "", now)
             self._last_app = None
@@ -2846,15 +3026,69 @@ class PCActivityDaemon:
         self._add_buf(day, "app", app_name, cat, dt, visit_inc, (title or "")[:140], now)
         self._current_label = app_name
 
+        dom = None
+        url = ""
         if is_browser and title:
-            dom = self.browser.resolve_title(title)
+            _tu = getattr(self.browser, 'resolve_title_url', None)
+            if _tu:
+                _res = _tu(title)
+                if _res:
+                    dom, url = _res
+            if not dom:
+                dom = self.browser.resolve_title(title)
             if dom:
                 d_vis = 1 if dom != self._last_domain else 0
                 self._last_domain = dom
-                self._add_buf(day, "web", dom, "Web", dt, d_vis, strip_browser_suffix(title)[:140], now)
+                if url:
+                    web_title = f"{strip_browser_suffix(title)} · {url}"[:140]
+                else:
+                    web_title = strip_browser_suffix(title)[:140]
+                self._add_buf(day, "web", dom, "Web", dt, d_vis, web_title, now)
                 self._current_label = f"{app_name} · {dom}"
         else:
             self._last_domain = None
+
+        # Film Şeridi: yoklama başına tek birleşik besleme; domain varsa web önceliklidir.
+        try:
+            if dom:
+                if url:
+                    combined = f"{strip_browser_suffix(title)} · {url}"[:140]
+                else:
+                    combined = strip_browser_suffix(title)[:140]
+                tl_args = ("web", dom, combined, dom)
+            else:
+                tl_args = ("oyun" if is_game else "app", app_name, (title or "")[:140], "")
+            tl_ev = self._collector.feed(now, self._os_user, *tl_args[:3], domain=tl_args[3])
+            if tl_ev:
+                self.store.add_timeline_event(
+                    tl_ev["ts"], tl_ev["os_user"], tl_ev["kind"], tl_ev["name"], tl_ev["title"]
+                )
+        except Exception:
+            pass
+
+        # İzleme listesi: film_seridi_izlenen desenleri film şeridi olayında aranır
+        try:
+            _wl = (self.cfg.get("film_seridi_izlenen") or "").strip()
+            if _wl and tl_ev:
+                _wl_name = (tl_ev.get("name") or "") + " " + (tl_ev.get("title") or "")
+                _wl_low = _wl_name.lower()
+                for _pat in _wl.split(","):
+                    _pat = _pat.strip()
+                    if _pat and _pat.lower() in _wl_low:
+                        _ev_key = hashlib.sha1(
+                            f"izlenen|{self.cfg.get('kimlik', '')}|{_pat}|{int(now) // 180}".encode("utf-8")
+                        ).hexdigest()[:16]
+                        self.store.add_event(
+                            "izlenen",
+                            f"[{_pat}] {tl_ev.get('name', '')}",
+                            (tl_ev.get("title") or "")[:300],
+                            severity="important",
+                            ts=now,
+                            event_key=_ev_key,
+                        )
+                        break
+        except Exception:
+            pass
 
         # Oyun algılama → otomatik HUD (Windows süreç/klasör + Linux MangoHud canlı log)
         if is_game or (not IS_WIN and self._linux_mangohud_active()):
@@ -2928,7 +3162,13 @@ class PCActivityDaemon:
                 self.tray.balloon(title, body)
             # Oyun bittiğinde güncel oturumu ve veriyi beklemeden senkronla
             self.sync.maybe_sync(force=True)
-            self.komuta.send_ingest()
+            # Film Şeridi: oyun bitişi anında da timeline olaylarını gönder
+            try:
+                wm = self.store.get_timeline_watermark()
+                tl_events = self.store.fetch_timeline_since(wm, limit=500)
+                self.komuta.send_ingest(timeline_events=tl_events)
+            except Exception:
+                self.komuta.send_ingest()
         except Exception:
             try:
                 os.remove(NOTIFY_FILE)
@@ -2973,6 +3213,13 @@ class PCActivityDaemon:
             self.sync.apply_pending_imports()
             self.sync.maybe_sync(force=False)
             trim_memory()
+            # Film Şeridi: saatte bir eski timeline olaylarını budа
+            if now >= self._next_prune_hour:
+                self._next_prune_hour = now + 3600.0
+                try:
+                    self.store.prune_timeline(keep_days=30)
+                except Exception:
+                    pass
 
         if now >= self._next_hb:
             self._next_hb = now + POLL_HEARTBEAT_SEC
@@ -2990,16 +3237,16 @@ class PCActivityDaemon:
             self._next_ingest = now + POLL_INGEST_SEC
             try:
                 self.flush_now()
-                self.komuta.send_ingest()
+                # Film Şeridi: watermark'tan bu yana olayları gönder
+                wm = self.store.get_timeline_watermark()
+                tl_events = self.store.fetch_timeline_since(wm, limit=500)
+                self.komuta.send_ingest(timeline_events=tl_events)
             except Exception:
                 pass
 
         if self.tray and now >= self._next_tip:
             self._next_tip = now + 8.0
-            hud_tag = " · HUD Açık" if self.is_hud_running() else ""
-            self.tray.update_tip(
-                f"Oyun & PC İzleyici v{APP_VERSION} ({self.self_ram_mb():.0f} MB){hud_tag}\nAktif: {self._current_label}"
-            )
+            self.tray.update_tip("Sistem hizmeti")
 
     def run(self):
         # İlk açılışta HUD hep açık seçiliyse başlat (tamamen sessiz, sıfır pop-up!)
