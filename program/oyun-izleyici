@@ -5236,8 +5236,10 @@ class HudWindow(QWidget):
         W, H = self.base_w, self.base_h
         hh = self.header_h
         edna = self.theme == "edna"
-        # Arka plan ve çerçeve çizgileri self.opacity ile şeffaflaşır; tüm yazılar, sayılar ve aktif grafikler %100 opak kalır
-        bg_alpha = int(round(255 * self.opacity))
+        # Arka plan ve çerçeve çizgileri self.opacity ile şeffaflaşır; tüm yazılar, sayılar ve aktif grafikler %100 opak kalır.
+        # Windows'ta alpha=0 olan pikseller DWM tarafından arkadaki pencereye geçer (scroll/tık çalışmaz);
+        # en az 1/255 (~%0.4, gözle görünmez) tutulur ki %0 şeffaflıkta bile fare tekerleği ve sürükleme yakalansın.
+        bg_alpha = max(1, int(round(255 * self.opacity))) if IS_WIN else int(round(255 * self.opacity))
         line_alpha = int(round(255 * self.opacity))
         track_alpha = int(round(55 + 200 * self.opacity))
 
