@@ -764,6 +764,23 @@ class SessionStore:
                 return r
         return None
 
+    def game_past_seconds(self, game, machine=None, exclude_log=None):
+        """Bu PC'de belirtilen oyunun mevcut aktif log hariç toplam oynama süresi (saniye)."""
+        if not game:
+            return 0.0
+        mid = machine or self.machine_id
+        if exclude_log:
+            row = self.db.execute(
+                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND game=? AND log_file<>?",
+                (mid, game, exclude_log),
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND game=?",
+                (mid, game),
+            ).fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
     def sessions(self, game=None, machine=None):
         w, a = self._where(machine, game)
         return self.db.execute(f"SELECT * FROM sessions{w} ORDER BY start_ts DESC", a).fetchall()
@@ -4992,7 +5009,8 @@ class HudWindow(QWidget):
             self.theme = "klasik"
         self.header_h = HEADER_H if self.show_clock else 0
         self.telem_h = TELEM_H if self.show_telem else 0
-        self.base_h = 770 + self.header_h + self.telem_h
+        self.base_h = 792 + self.header_h + self.telem_h
+        self._game_total_cache = ("", "", 0.0, 0.0)
         self._hot_since = None
         self._last_thermal_alert = 0.0
         self.drag_pos = None
@@ -5072,12 +5090,12 @@ class HudWindow(QWidget):
         self.update()
 
     def _update_rect(self):
-        return QRectF(8, 738 + self.telem_h, 374, 26)
+        return QRectF(8, 742 + self.telem_h, 374, 26)
 
     def set_show_clock(self, on):
         self.show_clock = bool(on)
         self.header_h = HEADER_H if self.show_clock else 0
-        self.base_h = 770 + self.header_h + self.telem_h
+        self.base_h = 792 + self.header_h + self.telem_h
         self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
         self.save_settings()
         self.update()
@@ -5085,7 +5103,7 @@ class HudWindow(QWidget):
     def set_show_telem(self, on):
         self.show_telem = bool(on)
         self.telem_h = TELEM_H if self.show_telem else 0
-        self.base_h = 770 + self.header_h + self.telem_h
+        self.base_h = 792 + self.header_h + self.telem_h
         self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
         self.save_settings()
         self.update()
@@ -6261,7 +6279,7 @@ class HudWindow(QWidget):
                 break
         p.setPen(white)
         main_footer = p.fontMetrics().elidedText(main_footer, Qt.TextElideMode.ElideRight, W - 20)
-        p.drawText(QRectF(8, y_footer + 8, W - 16, 40), Qt.AlignmentFlag.AlignCenter, main_footer)
+        p.drawText(QRectF(8, y_footer + 6, W - 16, 36), Qt.AlignmentFlag.AlignCenter, main_footer)
 
         f_sub_brand = self._font(12 if t.game_name else 11)
         p.setFont(f_sub_brand)
@@ -6276,10 +6294,11 @@ class HudWindow(QWidget):
             p.drawText(ur, Qt.AlignmentFlag.AlignCenter, f"⬆ {vtag}GÜNCELLEME VAR — TIKLA VE GÜNCELLE")
         else:
             p.setPen(green)
+            total_pc_line = ""
             if sm:
                 sub_footer = f"BİTTİ · {fmt_duration(sm['duration_s'], True)}"
                 if sm.get("total_secs"):
-                    sub_footer += f" · TOPLAM {fmt_duration(sm['total_secs'], True)}"
+                    total_pc_line = f"BU PC TOPLAM · {fmt_duration(sm['total_secs'])}"
             elif t.game_name:
                 sess_sec = max(0.0, time.time() - t.session.start_ts) if t.session else 0.0
                 if sess_sec <= 0 and t.session:
@@ -6289,9 +6308,30 @@ class HudWindow(QWidget):
                     sub_footer = f"OYUN DURAKLATILDI · {timer_str}"
                 else:
                     sub_footer = f"OYUN SÜRESİ · {timer_str}"
+                past_sec = 0.0
+                if self.store is not None:
+                    cur_log = getattr(t.session, "log_file", "") or ""
+                    cg, cl, csec, cts = getattr(self, "_game_total_cache", ("", "", 0.0, 0.0))
+                    now_t = time.time()
+                    if cg != t.game_name or cl != cur_log or (now_t - cts) > 60.0:
+                        try:
+                            csec = self.store.game_past_seconds(t.game_name, self.store.machine_id, exclude_log=cur_log)
+                        except Exception:
+                            csec = 0.0
+                        self._game_total_cache = (t.game_name, cur_log, csec, now_t)
+                    past_sec = csec
+                total_pc_sec = past_sec + sess_sec
+                total_pc_line = f"BU PC TOPLAM · {fmt_duration(total_pc_sec)}"
             else:
                 sub_footer = f"OTURUM SÜRESİ · {fmt_clock_timer(read_system_uptime())}"
-            p.drawText(QRectF(8, y_footer + 48, W - 16, 28), Qt.AlignmentFlag.AlignCenter, sub_footer)
+            if total_pc_line:
+                p.drawText(QRectF(8, y_footer + 42, W - 16, 24), Qt.AlignmentFlag.AlignCenter, sub_footer)
+                p.setFont(self._font(11))
+                total_col = QColor(205, 224, 232) if edna else QColor(200, 212, 220)
+                p.setPen(total_col)
+                p.drawText(QRectF(8, y_footer + 66, W - 16, 24), Qt.AlignmentFlag.AlignCenter, total_pc_line)
+            else:
+                p.drawText(QRectF(8, y_footer + 48, W - 16, 28), Qt.AlignmentFlag.AlignCenter, sub_footer)
 
         p.end()
 
