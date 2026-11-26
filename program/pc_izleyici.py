@@ -3111,7 +3111,10 @@ if IS_WIN:
         def _proc(self, hwnd, msg, wp, lp):
             if msg == WM_HOTKEY:
                 if (wp & 0xFFFF) == HOTKEY_HUD_ID:
-                    self.daemon.toggle_hud_manual()
+                    now_hk = time.monotonic()
+                    if now_hk - getattr(self, "_last_hotkey_ts", 0.0) >= 0.45:
+                        self._last_hotkey_ts = now_hk
+                        self.daemon.toggle_hud_manual()
                 return 0
             if msg == WM_TRAY:
                 ev = lp & 0xFFFF
@@ -3237,6 +3240,7 @@ class PCActivityDaemon:
         self._hud_proc = None
         self._hud_auto_launched = False
         self._hud_suppressed_until_game_ends = False
+        self._hud_started_ts = 0.0
         self._dash_proc = None
         self._last_game_seen_ts = 0.0
         self._current_label = "Hazır"
@@ -3277,6 +3281,7 @@ class PCActivityDaemon:
         try:
             self._hud_proc = subprocess.Popen(args, close_fds=True, **_hidden())
             self._hud_auto_launched = auto
+            self._hud_started_ts = time.monotonic()
         except Exception:
             self._hud_proc = None
 
@@ -3306,6 +3311,9 @@ class PCActivityDaemon:
 
     def toggle_hud_manual(self):
         if self.is_hud_running():
+            # Yeni açılmış HUD'u tuş sıçramasıyla (<1.0 sn) yanlışlıkla hemen kapatma
+            if time.monotonic() - getattr(self, "_hud_started_ts", 0.0) < 1.0:
+                return
             self._hud_suppressed_until_game_ends = True
             self.stop_hud()
         else:

@@ -5012,12 +5012,14 @@ class HudWindow(QWidget):
 
         self.setWindowTitle("Raven Watch — Canlı Oyun HUD")
         self._apply_window_flags()
-        try:
-            from PySide6.QtGui import QKeySequence, QShortcut
-            self._sc_toggle = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
-            self._sc_toggle.activated.connect(self.close)
-        except Exception:
-            pass
+        self._topmost_tick = 0
+        if not self.daemon_managed:
+            try:
+                from PySide6.QtGui import QKeySequence, QShortcut
+                self._sc_toggle = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
+                self._sc_toggle.activated.connect(self.close)
+            except Exception:
+                pass
         self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
         saved_pos = self.settings.value("pos", None, type=QPoint)
         if saved_pos is not None and QGuiApplication.screenAt(saved_pos + QPoint(20, 20)) is not None:
@@ -5160,7 +5162,32 @@ class HudWindow(QWidget):
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setWindowOpacity(1.0)
+
+    def _enforce_win_topmost(self):
+        """Windows'ta oyun odağa dönünce HUD'un arka plana düşmesini engeller (odağı çalmadan HWND_TOPMOST)."""
+        if not (IS_WIN and self.always_on_top and self.isVisible()):
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            u32 = ctypes.windll.user32
+            u32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            u32.SetWindowPos.restype = ctypes.c_int
+            # HWND_TOPMOST = -1; SWP_NOSIZE (0x1) | SWP_NOMOVE (0x2) | SWP_NOACTIVATE (0x10)
+            u32.SetWindowPos(ctypes.c_void_p(hwnd), ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0013)
+        except Exception:
+            pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._enforce_win_topmost()
 
     def move_to_left_hdmi_monitor(self):
         screens = QGuiApplication.screens()
@@ -5250,6 +5277,9 @@ class HudWindow(QWidget):
                 self.shutdown()
                 QApplication.instance().quit()
                 return
+        self._topmost_tick = getattr(self, "_topmost_tick", 0) + 1
+        if self._topmost_tick % 4 == 0:
+            self._enforce_win_topmost()
         t = self.telemetry
         if t.gpu.nv is not None:
             t.gpu.nv.wanted = self.isVisible() or t.capturing()
