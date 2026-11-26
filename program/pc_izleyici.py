@@ -133,7 +133,7 @@ def load_machine_config():
     cfg.setdefault("kimlik", _slug(host))
     cfg.setdefault("ad", host)
     cfg.setdefault("senkron", "acik")
-    cfg.setdefault("hud_oto", "acik")
+    cfg.setdefault("hud_oto", "kapali")
     cfg.setdefault("hud_hep_acik", "kapali")
     cfg.setdefault("hafif_mod", "acik")
     return cfg
@@ -3072,7 +3072,7 @@ if IS_WIN:
             menu = self._u32.CreatePopupMenu()
             hud_on = self.daemon.is_hud_running()
             cfg = self.daemon.cfg
-            auto_on = cfg.get("hud_oto", "acik") != "kapali"
+            auto_on = cfg.get("hud_oto", "kapali") == "acik"
             always_on = cfg.get("hud_hep_acik", "kapali") == "acik"
             ram_mb = self.daemon.self_ram_mb()
 
@@ -3133,7 +3133,7 @@ if IS_WIN:
                 elif cmd == self.CMD_TOGGLE_HUD:
                     self.daemon.toggle_hud_manual()
                 elif cmd == self.CMD_TOGGLE_AUTO:
-                    cur = self.daemon.cfg.get("hud_oto", "acik") != "kapali"
+                    cur = self.daemon.cfg.get("hud_oto", "kapali") == "acik"
                     nv = "kapali" if cur else "acik"
                     self.daemon.cfg["hud_oto"] = nv
                     save_machine_config({"hud_oto": nv})
@@ -3455,7 +3455,7 @@ class PCActivityDaemon:
             if is_game:
                 self._last_game_name = app_name
             if (
-                self.cfg.get("hud_oto", "acik") != "kapali"
+                self.cfg.get("hud_oto", "kapali") == "acik"
                 and not getattr(self, "_hud_suppressed_until_game_ends", False)
                 and not self.is_hud_running()
             ):
@@ -3635,7 +3635,7 @@ class PCActivityDaemon:
         # İlk açılışta HUD hep açık seçiliyse başlat (tamamen sessiz, sıfır pop-up!)
         if self.cfg.get("hud_hep_acik", "kapali") == "acik":
             self.ensure_hud_running(auto=False)
-        elif self.cfg.get("hud_oto", "acik") != "kapali" and self._any_game_process_running():
+        elif self.cfg.get("hud_oto", "kapali") == "acik" and self._any_game_process_running():
             self._last_game_seen_ts = time.time()
             self.ensure_hud_running(auto=True)
 
