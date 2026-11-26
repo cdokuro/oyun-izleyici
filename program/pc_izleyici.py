@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PC & Oyun İzleyici — Hafif Arka Plan Servisi (v4.4.0)
+Raven Watch — Hafif Arka Plan Servisi (v4.5.0)
 
 PySide6 / Qt YÜKLEMEZ! Yalnızca standart kütüphane + psutil + SQLite + Win32/Linux
 yerel çağrılarıyla ~20-25 MB RAM bandında 7/24 sessizce çalışır:
@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-APP_VERSION = "4.4.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.5.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 IS_WIN = sys.platform.startswith("win")
 
 if IS_WIN:
@@ -275,9 +275,12 @@ def _build_machine_info(cfg):
         try:
             cls_key = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls_key) as k:
-                for i in range(16):
+                sub_count = winreg.QueryInfoKey(k)[0]
+                for i in range(sub_count):
                     try:
-                        sk_name = f"{i:04d}"
+                        sk_name = winreg.EnumKey(k, i)
+                        if not sk_name.isdigit():
+                            continue
                         with winreg.OpenKey(k, sk_name) as sk:
                             desc = str(winreg.QueryValueEx(sk, "DriverDesc")[0])
                             if desc:
@@ -2224,9 +2227,12 @@ class SystemAuditor:
             try:
                 cls_key = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
                 with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls_key) as k:
-                    for i in range(16):
+                    sub_count = winreg.QueryInfoKey(k)[0]
+                    for i in range(sub_count):
                         try:
-                            sk_name = f"{i:04d}"
+                            sk_name = winreg.EnumKey(k, i)
+                            if not sk_name.isdigit():
+                                continue
                             with winreg.OpenKey(k, sk_name) as sk:
                                 desc = winreg.QueryValueEx(sk, "DriverDesc")[0]
                                 ver = winreg.QueryValueEx(sk, "DriverVersion")[0]
@@ -2367,7 +2373,7 @@ class SystemAuditor:
             drv_cnt = len(sys_now.get("gpu_drivers") or {})
             self.store.add_event(
                 "sistem",
-                "PC & Oyun İzleyici v4 İlk Sistem Taraması",
+                "Raven Watch v4 İlk Sistem Taraması",
                 f"{len(progs)} program, {len(games)} oyun, {len(sys_now.get('startup', {}))} başlangıç öğesi, {drv_cnt} GPU sürücüsü kaydedildi.",
                 "info", ts=now, event_key="v4_initial_baseline",
             )
@@ -2949,7 +2955,7 @@ if IS_WIN:
             wc.lpszClassName = cls_name
             self._u32.RegisterClassW(ctypes.byref(wc))
             self.hwnd = self._u32.CreateWindowExW(
-                0, cls_name, "Oyun İzleyici Servis", 0, 0, 0, 0, 0, None, None, hinst, None
+                0, cls_name, "Raven Watch Servis", 0, 0, 0, 0, 0, None, None, hinst, None
             )
             self.hicon = _create_tray_hicon()
             self._nid = NOTIFYICONDATAW()
@@ -2959,7 +2965,7 @@ if IS_WIN:
             self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
             self._nid.uCallbackMessage = WM_TRAY
             self._nid.hIcon = self.hicon
-            self._nid.szTip = f"Oyun & PC İzleyici v{APP_VERSION} · Hafif Mod"
+            self._nid.szTip = f"Raven Watch v{APP_VERSION} · Hafif Mod"
             self._s32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
 
         def update_tip(self, text):
@@ -2994,7 +3000,7 @@ if IS_WIN:
 
             self._u32.AppendMenuW(menu, MF_STRING, self.CMD_DASHBOARD, "Meraklısına Veriler")
             self._u32.SetMenuDefaultItem(menu, self.CMD_DASHBOARD, 0)
-            self._u32.AppendMenuW(menu, MF_STRING, self.CMD_WEB_KOMUTA, "🌐 Web Komuta Merkezi (serhatbahar.com/komuta)")
+            self._u32.AppendMenuW(menu, MF_STRING, self.CMD_WEB_KOMUTA, "🌐 Raven Watch Web (serhatbahar.com/komuta)")
             self._u32.AppendMenuW(
                 menu, MF_STRING, self.CMD_TOGGLE_HUD,
                 "🎮 Canlı Oyun HUD'unu Kapat" if hud_on else "🎮 Canlı Oyun HUD'unu Aç",
@@ -3057,7 +3063,7 @@ if IS_WIN:
                         self.daemon.stop_hud()
                 elif cmd == self.CMD_SYNC:
                     self.daemon.sync.maybe_sync(force=True)
-                    self.balloon("Oyun & PC İzleyici", "GitHub senkronizasyonu başlatıldı…")
+                    self.balloon("Raven Watch", "GitHub senkronizasyonu başlatıldı…")
                 elif cmd == self.CMD_SETTINGS:
                     self.daemon.launch_dashboard(extra_args=["--sync"])
                 elif cmd == self.CMD_EXIT:
@@ -3139,6 +3145,7 @@ class PCActivityDaemon:
         self._next_hb = time.time() + 12.0
         self._next_ingest = time.time() + 25.0
         self._next_tip = time.time() + 5.0
+        self._next_enroll_retry = time.time() + 60.0
 
         # Çocuk HUD & Dashboard süreç yönetimi
         self._hud_proc = None
@@ -3411,7 +3418,7 @@ class PCActivityDaemon:
             with open(NOTIFY_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             os.remove(NOTIFY_FILE)
-            title = (data.get("title") or "Oyun İzleyici").strip()
+            title = (data.get("title") or "Raven Watch").strip()
             body = (data.get("body") or "").strip()
             if self.tray and body:
                 self.tray.balloon(title, body)
@@ -3475,6 +3482,19 @@ class PCActivityDaemon:
                     self.store.prune_timeline(keep_days=30)
                 except Exception:
                     pass
+
+        if now >= self._next_enroll_retry:
+            self._next_enroll_retry = now + 60.0
+            if not read_komuta_key():
+                try:
+                    fresh_cfg = load_machine_config()
+                    if os.environ.get("OI_ENROLL") or fresh_cfg.get("enroll_code"):
+                        run_enrollment()
+                        if read_komuta_key():
+                            self.cfg = load_machine_config()
+                            self.komuta = KomutaPusher(self.store, self.cfg)
+                except Exception as e:
+                    print(f"[pc_izleyici] enrollment yeniden deneme hatası: {e}", file=sys.stderr)
 
         if now >= self._next_hb:
             self._next_hb = now + POLL_HEARTBEAT_SEC

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Oyun Izleyici - Windows kurulum / guncelleme betigi.
+  Raven Watch - Windows kurulum / guncelleme betigi.
 
 .DESCRIPTION
   1. Python 3.10+ bulur (yoksa winget ile kurar) ve %LOCALAPPDATA%\oyun-izleyici\venv icine PySide6 + psutil kurar
@@ -189,12 +189,12 @@ function New-Shortcut([string]$path) {
     $lnk.TargetPath = $VenvPyW
     $lnk.Arguments = '"' + $AppFile + '"'
     $lnk.WorkingDirectory = $Data
-    $lnk.Description = "Oyun Izleyici"
+    $lnk.Description = "Raven Watch"
     $lnk.Save()
 }
 Say "Baslat menusu ve otomatik baslatma kisayollari"
-New-Shortcut (Join-Path ([Environment]::GetFolderPath("Programs")) "Oyun Izleyici.lnk")
-New-Shortcut (Join-Path ([Environment]::GetFolderPath("Startup"))  "Oyun Izleyici.lnk")
+New-Shortcut (Join-Path ([Environment]::GetFolderPath("Programs")) "Raven Watch.lnk")
+New-Shortcut (Join-Path ([Environment]::GetFolderPath("Startup"))  "Raven Watch.lnk")
 
 $taniBat = Join-Path $Data "tani.bat"
 $taniText = "@echo off`r`nchcp 65001 >nul`r`n`"$VenvPy`" `"$AppFile`" --tani`r`npause`r`n"
@@ -251,7 +251,7 @@ if ($env:OI_KOMUTA_URL) {
 if ($env:OI_KOMUTA_KEY) {
     Set-Content -Path (Join-Path $Roam "komuta.key") -Value $env:OI_KOMUTA_KEY -Encoding UTF8 -NoNewline
 }
-Say "Oyun Izleyici baslatiliyor"
+Say "Raven Watch baslatiliyor"
 Start-Process -FilePath $VenvPyW -ArgumentList ('"' + $AppFile + '"') -WorkingDirectory $Data
 
 Write-Host ""

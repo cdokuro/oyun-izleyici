@@ -1,11 +1,11 @@
-# Oyun İzleyici
+# Raven Watch
 
-Oyun oynarken canlı **FPS, 1% / 0.1% low, frametime, GPU / CPU / RAM** değerlerini gösteren bir panel; her oyun oturumunu kaydedip **oyun başına toplam süre ve ortalamaları**, ayrıca **iki PC'nin karşılaştırmasını** sunar.
+Oyun oynarken canlı **FPS, 1% / 0.1% low, frametime, GPU / CPU / RAM** değerlerini gösteren hafif çoklu-PC telemetri, oyun HUD ve web komuta merkezi (`serhatbahar.com/komuta`); her oyun oturumunu kaydedip **oyun başına toplam süre ve ortalamaları**, ayrıca **PC'ler arası karşılaştırmayı** sunar.
 
 - **Linux** (CachyOS / Arch tabanlı, AMD · NVIDIA · Intel): FPS için [MangoHud](https://github.com/flightlessmango/MangoHud) kayıtları, sensörler için `/sys` ve `/proc`.
 - **Windows 10/11** (NVIDIA / Intel / AMD): FPS için Intel'in [PresentMon](https://github.com/GameTechDev/PresentMon)'u, sensörler için `psutil`, `nvidia-smi` ve WMI.
 
-> **Durum:** Linux sürümü günlük kullanımda. Windows sürümü yeni: mantığı sahte PresentMon ile uçtan uca test edildi ama gerçek Windows'ta henüz az denendi. Sorun olursa `tani.bat` çıktısıyla issue aç.
+> **Sürüm:** `v4.5.0` — İki süreçli hafif mimari (7/24 ~15–20 MB tepsi servisi + oyun açılınca otomatik HUD), cihaz-başına anahtar enrollment, pinned LAN TLS ve SHA-256 doğrulamalı GitHub Release güncelleyici.
 
 ## Özellikler
 - Dikey HUD paneli (taşınır, boyutlanır, saydamlaşır, tema rengi ya da KDE "Edna" temasıyla uyumlu hazır tema); üstte saat ve tarih şeridi; tek ekranda sadece tepsi simgesi.

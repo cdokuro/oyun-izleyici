@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Oyun İzleyici — kurulum / güncelleme (CachyOS / Arch tabanlı her PC için)
+# Raven Watch — kurulum / güncelleme (CachyOS / Arch tabanlı her PC için)
 #
 #   bash kur.sh                 -> kur veya güncelle (PC adı = hostname)
 #   bash kur.sh "Laptop"        -> listelerde görünecek PC adını belirle (ilk kurulumda)
@@ -163,12 +163,12 @@ raw = open(path, encoding="utf-8").read()
 lines = raw.splitlines()
 had_no_display = any(re.match(r"^\s*no_display\s*(=.*)?$", l) for l in lines)
 drop = re.compile(r"^\s*(no_display|output_folder|autostart_log|log_duration|log_interval|blacklist)\s*(=.*)?$")
-out = [l for l in lines if not drop.match(l) and "Oyun İzleyici" not in l]
+out = [l for l in lines if not drop.match(l) and "Oyun İzleyici" not in l and "Raven Watch" not in l]
 if had_no_display:
     # no_display açıkken MangoHud kayıt başlatmıyor: HUD'u şeffaf yaparak gizle
     out = [l for l in out if not re.match(r"^\s*(legacy_layout|alpha|background_alpha)\s*=", l)]
     out += ["legacy_layout=0", "alpha=0", "background_alpha=0"]
-out += ["# --- Oyun İzleyici: otomatik FPS kaydı (kur.sh) ---",
+out += ["# --- Raven Watch: otomatik FPS kaydı (kur.sh) ---",
         "blacklist=kwin_wayland,kwin_wayland_wrapper,plasmashell,Xwayland,krunner,ksplashqml,systemsettings,dolphin,konsole",
         "output_folder=/tmp/mangohud_live", "log_interval=100", "autostart_log=1"]
 new_raw = "\n".join(out) + "\n"
@@ -178,13 +178,13 @@ if new_raw != raw:
 PY
 else
     cat > "$MH" <<'EOF'
-# Oyun İzleyici: HUD görünmez ama FPS kaydı canlı yazılır (Shift_R+F12 ile gizle/göster)
+# Raven Watch: HUD görünmez ama FPS kaydı canlı yazılır (Shift_R+F12 ile gizle/göster)
 legacy_layout=0
 alpha=0
 background_alpha=0
 hud_no_margin
 toggle_hud=Shift_R+F12
-# --- Oyun İzleyici: otomatik FPS kaydı (kur.sh) ---
+# --- Raven Watch: otomatik FPS kaydı (kur.sh) ---
 blacklist=kwin_wayland,kwin_wayland_wrapper,plasmashell,Xwayland,krunner,ksplashqml,systemsettings,dolphin,konsole
 output_folder=/tmp/mangohud_live
 log_interval=100
@@ -225,8 +225,8 @@ write_desktop() {  # $1 = hedef dosya, $2 = Exec satırı, $3 = ek satırlar
     cat > "$1" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Oyun İzleyici
-Comment=Canlı FPS / donanım izleyici, oyun geçmişi ve PC karşılaştırma
+Name=Raven Watch
+Comment=Raven Watch — canlı FPS / donanım izleyici, oyun geçmişi ve PC karşılaştırma
 Exec=$2
 Icon=utilities-system-monitor
 Terminal=false
@@ -263,7 +263,7 @@ if [[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
     else
         setsid -f "$HOME/.local/bin/oyun-izleyici" >/dev/null 2>&1 < /dev/null
     fi
-    say "Oyun İzleyici başlatıldı"
+    say "Raven Watch başlatıldı"
 else
     say "Grafik oturum bulunamadı: bir sonraki girişte otomatik başlayacak"
 fi
