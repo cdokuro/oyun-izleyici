@@ -18,7 +18,7 @@ import time
 import math
 from collections import deque
 
-APP_VERSION = "4.3.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.4.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar (v4.4.0: release+hash güncelleyici)
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
@@ -1038,23 +1038,37 @@ class SyncManager:
         return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
     def check_app_update(self):
-        """Güncelleme rozetini yalnızca depodaki MAJOR veya MINOR sürüm (ör. 3.0 -> 3.1 / 4.0)
-        kurulu sürümden büyükse gösterir; küçük yama veya yerel farklarda asla çıkmaz."""
-        repo_bin = os.path.join(REPO_DIR, "program", "oyun-izleyici")
-        if not os.path.isfile(repo_bin):
-            self.update_available = False
-            self.remote_version = None
-            return False
+        """Güncelleme rozetini yalnızca public GitHub release'in MAJOR veya MINOR sürümü
+        kurulu sürümden büyükse gösterir; küçük yama veya yerel farklarda asla çıkmaz.
+        Kaynak: public repo latest release → manifest.json (release+hash zinciri)."""
         try:
-            with open(repo_bin, "r", encoding="utf-8", errors="ignore") as f:
-                head = f.read(4096)
-            rem = self._parse_version(head)
-            loc = self._parse_version(f'APP_VERSION = "{APP_VERSION}"') or (0, 0, 0)
-            if rem is None or rem[:2] <= loc[:2]:
+            import json as _json
+            import urllib.request as _ur
+            _status, release = github_api_request(
+                "GET", "https://api.github.com/repos/cdokuro/oyun-izleyici/releases/latest")
+            manifest_asset = None
+            for asset in release.get("assets", []):
+                if asset.get("name") == "manifest.json":
+                    manifest_asset = asset
+                    break
+            if manifest_asset is None:
                 self.update_available = False
                 self.remote_version = None
                 return False
-            ver_str = f"{rem[0]}.{rem[1]}.{rem[2]}"
+            with _ur.urlopen(manifest_asset["browser_download_url"], timeout=15) as resp:
+                manifest = _json.loads(resp.read().decode("utf-8"))
+            ver_str = manifest.get("version", "")
+            m = re.match(r'^(\d+)\.(\d+)\.(\d+)$', ver_str)
+            if not m:
+                self.update_available = False
+                self.remote_version = None
+                return False
+            rem = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            loc = self._parse_version(f'APP_VERSION = "{APP_VERSION}"') or (0, 0, 0)
+            if rem[:2] <= loc[:2]:
+                self.update_available = False
+                self.remote_version = None
+                return False
             self.update_available = True
             self.remote_version = ver_str
             if self._notified_update_ver != ver_str:
@@ -1063,7 +1077,7 @@ class SyncManager:
                        "GitHub'dan büyük bir uygulama güncellemesi indirildi. "
                        "Paneldeki 'GÜNCELLE' rozetine veya sağ tık menüsündeki 'Uygulamayı Şimdi Güncelle'ye tıklayın.")
             return True
-        except OSError:
+        except Exception:
             self.update_available = False
             self.remote_version = None
             return False
@@ -1328,25 +1342,114 @@ class SyncManager:
         return f"GitHub{tag}{ro}: bekliyor" + upd
 
 
-def apply_app_update(parent_win=None):
-    """kur.sh betiğini çalıştırarak ~/.local/bin/oyun-izleyici'yi günceller ve uygulamayı yerinde yeniden başlatır."""
-    import shutil
-    repo_bin = os.path.join(REPO_DIR, "program", "oyun-izleyici")
-    inst_bin = INSTALLED_BIN
-    if not os.path.isfile(repo_bin):
-        notify("Oyun İzleyici", "Güncelleme dosyası bulunamadı.")
-        return
+def _verify_file(path, expected_sha256):
+    """Dosyanın SHA-256 özetini doğrular (make-release.py'deki verify_file ile ikiz).
+    Zaman sabiti karşılaştırma."""
+    import hashlib as _hashlib
     try:
-        os.makedirs(os.path.dirname(inst_bin), exist_ok=True)
-        if os.path.isfile(inst_bin):
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            shutil.copy2(inst_bin, f"{inst_bin}.yedek-{ts}")
-        shutil.copy2(repo_bin, inst_bin)
-        os.chmod(inst_bin, 0o755)
-        repo_daemon = os.path.join(REPO_DIR, "program", "pc_izleyici.py")
-        if os.path.isfile(repo_daemon):
-            inst_daemon = os.path.join(os.path.dirname(inst_bin), "pc_izleyici.py")
-            shutil.copy2(repo_daemon, inst_daemon)
+        h = _hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        actual = h.hexdigest()
+        if len(actual) != len(expected_sha256):
+            return False
+        result = 0
+        for a, b in zip(actual, expected_sha256):
+            result |= ord(a) ^ ord(b)
+        return result == 0
+    except (OSError, TypeError):
+        return False
+
+
+def apply_app_update(parent_win=None):
+    """Public GitHub release'ten SHA-256 doğrulamasıyla güncelleme indirir ve kurar.
+    manifest.json'daki hash'lerle uyuşmayan varlık KURULMAZ. Başarılıysa uygulamayı yeniden başlatır."""
+    import shutil
+    import json as _json
+    import urllib.request as _ur
+    import tempfile as _tmp
+    inst_bin = INSTALLED_BIN
+    try:
+        # 1) Latest release manifestosunu al
+        _status, release = github_api_request(
+            "GET", "https://api.github.com/repos/cdokuro/oyun-izleyici/releases/latest")
+        assets = {a["name"]: a for a in release.get("assets", [])}
+        if "manifest.json" not in assets:
+            notify("Oyun İzleyici — Güncelleme Hatası", "Release'te manifest.json bulunamadı.")
+            return
+        # manifest.json'u indir
+        with _ur.urlopen(assets["manifest.json"]["browser_download_url"], timeout=20) as resp:
+            manifest = _json.loads(resp.read().decode("utf-8"))
+        files = manifest.get("files", {})
+        # İki dosya birlikte yoksa karışık sürüm kurma.
+        needed = {"oyun-izleyici", "pc_izleyici.py"}
+        available = needed & set(files.keys())
+        if available != needed:
+            notify("Oyun İzleyici — Güncelleme Hatası",
+                   "Release manifestosunda beklenen iki dosya da bulunmalı; güncelleme yapılmadı.")
+            return
+        # 2) Her dosyayı geçici olarak indir ve SHA-256 doğrula
+        downloaded = {}  # name -> temp_path; temizliğin TEK sahibi aşağıdaki finally
+        try:
+            for name in ("oyun-izleyici", "pc_izleyici.py"):
+                entry = files[name]
+                asset = assets.get(name)
+                if asset is None:
+                    notify("Oyun İzleyici — Güncelleme Hatası",
+                           f"doğrulama başarısız: {name} (release varlığı yok)")
+                    return
+                tmp_fd, tmp_path = _tmp.mkstemp(prefix=f"oi_upd_{name}_")
+                os.close(tmp_fd)
+                downloaded[name] = tmp_path
+                try:
+                    _ur.urlretrieve(asset["browser_download_url"], tmp_path)
+                except Exception:
+                    notify("Oyun İzleyici — Güncelleme Hatası", f"İndirme başarısız: {name}")
+                    return
+                if not _verify_file(tmp_path, entry["sha256"]):
+                    notify("Oyun İzleyici — Güncelleme Hatası",
+                           f"doğrulama başarısız: {name}")
+                    return
+            # 3) Önce iki yedeği hazırla; sonra doğrulanmış dosyaları atomik yerleştir.
+            targets = {
+                "oyun-izleyici": inst_bin,
+                "pc_izleyici.py": os.path.join(os.path.dirname(inst_bin), "pc_izleyici.py"),
+            }
+            os.makedirs(os.path.dirname(inst_bin), exist_ok=True)
+            backups = {}
+            for name, target in targets.items():
+                if os.path.isfile(target):
+                    backups[name] = target + ".bak"
+                    shutil.copy2(target, backups[name])
+            os.chmod(downloaded["oyun-izleyici"], 0o755)
+            replaced = set()
+            try:
+                for name, target in targets.items():
+                    os.replace(downloaded[name], target)
+                    replaced.add(name)
+            except Exception as place_error:
+                rollback_errors = []
+                for name, target in targets.items():
+                    try:
+                        if name in backups:
+                            os.replace(backups[name], target)
+                        elif name in replaced and os.path.exists(target):
+                            os.unlink(target)
+                    except OSError as rollback_error:
+                        rollback_errors.append(f"{name}: {rollback_error}")
+                if rollback_errors:
+                    raise RuntimeError("Yerleştirme ve geri alma başarısız: " + "; ".join(rollback_errors)) from place_error
+                raise RuntimeError("Yerleştirme başarısız; iki dosya da .bak yedeğinden geri yüklendi.") from place_error
+        finally:
+            for tmp_path in downloaded.values():
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
     except Exception as e:
         notify("Oyun İzleyici — Güncelleme Hatası", str(e))
         return
