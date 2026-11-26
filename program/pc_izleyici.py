@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PC & Oyun İzleyici — Hafif Arka Plan Servisi (v4.3.0)
+PC & Oyun İzleyici — Hafif Arka Plan Servisi (v4.4.0)
 
 PySide6 / Qt YÜKLEMEZ! Yalnızca standart kütüphane + psutil + SQLite + Win32/Linux
 yerel çağrılarıyla ~20-25 MB RAM bandında 7/24 sessizce çalışır:
@@ -25,7 +25,9 @@ import os
 import platform
 import re
 import shutil
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -36,7 +38,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-APP_VERSION = "4.3.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.4.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 IS_WIN = sys.platform.startswith("win")
 
 if IS_WIN:
@@ -177,6 +179,239 @@ def read_komuta_key():
         return ""
 
 
+def pinned_https_fetch(url, body=None, headers=None, cert_sha256=None, timeout=15):
+    """HTTPS isteği — opsiyonel sertifika parmak izi sabitleme (certificate pinning).
+
+    cert_sha256 verilmişse ve URL https ise: TEK bağlantı üzerinden DER sertifika
+    SHA-256 karşılaştırılır, uyuşursa istek AYNI soketten gider; uyuşmazsa ValueError.
+    Pin yoksa / http ise doğrudan istek.
+    """
+    import http.client
+    parsed = urllib.parse.urlparse(url)
+    raw = None
+    if body is not None:
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
+    method = "POST" if raw else "GET"
+    path = parsed.path or "/"
+    if parsed.query:
+        path = path + "?" + parsed.query
+
+    # HTTPS + pin: tek bağlantı üzerinden doğrulama + istek
+    if parsed.scheme == "https" and cert_sha256:
+        host = parsed.hostname
+        port = parsed.port or 443
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
+        try:
+            conn.connect()
+            der_cert = conn.sock.getpeercert(binary_form=True)
+            actual_sha256 = hashlib.sha256(der_cert).hexdigest().lower()
+            if actual_sha256 != cert_sha256.lower():
+                conn.close()
+                raise ValueError("sertifika parmak izi uyuşmuyor")
+            # Pin geçti — isteği AYNI bağlantıdan gönder
+            conn.request(method, path, body=raw, headers=headers or {})
+            resp = conn.getresponse()
+            resp_body = resp.read().decode("utf-8")
+            if not 200 <= resp.status < 300:
+                raise ValueError(f"HTTP {resp.status}: {resp_body}")
+            try:
+                return json.loads(resp_body)
+            except ValueError:
+                return {"raw": resp_body}
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"sertifika parmak izi kontrolü başarısız: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # HTTPS pin'siz: sistem CA deposu ve hostname doğrulaması etkin
+    if parsed.scheme == "https":
+        ctx2 = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, context=ctx2, timeout=timeout)
+        try:
+            conn.request(method, path, body=raw, headers=headers or {})
+            resp = conn.getresponse()
+            resp_body = resp.read().decode("utf-8")
+            if not 200 <= resp.status < 300:
+                raise ValueError(f"HTTP {resp.status}: {resp_body}")
+            try:
+                return json.loads(resp_body)
+            except ValueError:
+                return {"raw": resp_body}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # HTTP (pin gereksiz)
+    req = urllib.request.Request(url, data=raw, method=method, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resp_body = resp.read().decode("utf-8")
+        try:
+            return json.loads(resp_body)
+        except ValueError:
+            return {"raw": resp_body}
+
+
+def _build_machine_info(cfg):
+    """Enrollment için makine bilgisi oluştur (save_heartbeat makine_info deseni)."""
+    import platform as _platform
+    host = _platform.node() or "pc"
+    info = {
+        "name": cfg.get("ad") or host,
+        "os": f"{_platform.system()} {_platform.release()}",
+        "gpu": "",
+    }
+    # GPU adı algıla (SystemAuditor deseni)
+    if IS_WIN and winreg:
+        try:
+            cls_key = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, cls_key) as k:
+                for i in range(16):
+                    try:
+                        sk_name = f"{i:04d}"
+                        with winreg.OpenKey(k, sk_name) as sk:
+                            desc = str(winreg.QueryValueEx(sk, "DriverDesc")[0])
+                            if desc:
+                                info["gpu"] = desc
+                                break
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+    else:
+        # Linux: lspci ile VGA bul
+        try:
+            out = subprocess.check_output(["lspci"], timeout=5, stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
+            for ln in out.splitlines():
+                if "VGA" in ln or "3D controller" in ln:
+                    parts = ln.split(":", 1)
+                    if len(parts) > 1:
+                        info["gpu"] = parts[-1].strip()
+                    break
+        except Exception:
+            pass
+    # CPU/RAM bilgisi (psutil varsa)
+    if psutil:
+        try:
+            vm = psutil.virtual_memory()
+            info["ram"] = f"{round(vm.total / (1024**3), 1)} GB"
+        except Exception:
+            pass
+        try:
+            info["cpu"] = _platform.processor() or f"{psutil.cpu_count(logical=True)} çekirdek"
+        except Exception:
+            pass
+    else:
+        info["cpu"] = _platform.processor() or "bilinmiyor"
+    info["has_battery"] = False
+    if IS_WIN:
+        try:
+            battery = psutil.sensors_battery() if psutil else None
+            info["has_battery"] = battery is not None
+        except Exception:
+            pass
+    return info
+
+
+def run_enrollment():
+    """Daemon başlangıcında enrollment akışı.
+
+    - komuta.key VAR → mevcut akış (anahtar zaten var)
+    - yok + OI_ENROLL env veya makine.conf enroll_code → POST /enroll → device_key yaz + code sil
+    - ikisi de yok → sessiz kapalı (heartbeat/ingest istek atmaz)
+    """
+    # (1) Anahtar zaten var mı?
+    if read_komuta_key():
+        return
+
+    # (2) Enrollment kodu var mı?
+    cfg = load_machine_config()
+    enroll_code = os.environ.get("OI_ENROLL") or cfg.get("enroll_code")
+    if not enroll_code:
+        # Anahtar yok + kod yok → sessiz kapalı
+        print("[pc_izleyici] enrollment: komuta.key ve enroll_code yok; heartbeat/ingest kapalı", file=sys.stderr)
+        return
+
+    # (3) POST /enroll
+    komuta_url = (cfg.get("komuta_url") or "").strip().rstrip("/")
+    if not komuta_url:
+        print("[pc_izleyici] enrollment: komuta_url yok", file=sys.stderr)
+        return
+
+    machine_id = cfg.get("kimlik") or _slug(platform.node() or "pc")
+    machine_info = _build_machine_info(cfg)
+    payload = {
+        "enroll_code": enroll_code,
+        "machine_id": machine_id,
+        "machine_info": machine_info,
+    }
+
+    # Sertifika parmak izi (varsa)
+    cert_sha256 = cfg.get("komuta_cert_sha256") or None
+
+    try:
+        resp = pinned_https_fetch(
+            f"{komuta_url}/enroll",
+            body=json.dumps(payload, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+            cert_sha256=cert_sha256,
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[pc_izleyici] enrollment başarısız: {e}", file=sys.stderr)
+        return
+
+    device_key = (resp.get("device_key") or "").strip()
+    if not device_key:
+        print("[pc_izleyici] enrollment: device_key boş", file=sys.stderr)
+        return
+
+    # (4) komuta.key'e yaz (0600 dengi)
+    os.makedirs(os.path.dirname(KOMUTA_KEY_PATH), exist_ok=True)
+    tmp = KOMUTA_KEY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(device_key + "\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, KOMUTA_KEY_PATH)
+
+    # Sunucunun DER parmak izini kaydet; sonraki TLS bağlantılarında anında pin uygulanır.
+    enrolled_cert_sha256 = str(resp.get("cert_sha256") or "").strip()
+    if enrolled_cert_sha256:
+        save_machine_config({"komuta_cert_sha256": enrolled_cert_sha256})
+
+    # (5) enroll_code'u makine.conf'dan tamamen sil
+    try:
+        lines = []
+        with open(MACHINE_CONF, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k = s.split("=", 1)[0].strip()
+                    if k == "enroll_code":
+                        continue  # satırı atla
+                lines.append(line)
+        tmp = MACHINE_CONF + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(lines)
+        os.replace(tmp, MACHINE_CONF)
+    except OSError:
+        pass
+
+    print(f"[pc_izleyici] enrollment başarılı: {machine_id}", file=sys.stderr)
+
+
 def _read_live_fps_temp():
     """Oyun açıkken canlı MangoHud/PresentMon CSV son satırından anlık FPS ve sıcaklık okur (0 maliyet)."""
     try:
@@ -236,18 +471,31 @@ class KomutaPusher:
         key = read_komuta_key() or (cfg.get("komuta_key") or "").strip()
         return url, key, cfg
 
-    def _post(self, url, key, payload, timeout=8):
+    def _post(self, url, key, payload, timeout=8, cfg=None):
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=raw, method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-Komuta-Key": key,
-                "User-Agent": f"oyun-izleyici/{APP_VERSION}",
-            },
+        headers = {
+            "Content-Type": "application/json",
+            "X-Komuta-Key": key,
+            "User-Agent": f"oyun-izleyici/{APP_VERSION}",
+        }
+        # CF Service Auth başlıkları (varsa)
+        if cfg:
+            cf_id = cfg.get("cf_client_id")
+            cf_secret = cfg.get("cf_client_secret")
+            if cf_id and cf_secret:
+                headers["CF-Access-Client-Id"] = cf_id
+                headers["CF-Access-Client-Secret"] = cf_secret
+        # Sertifika parmak izi (varsa)
+        cert_sha256 = None
+        if cfg:
+            cert_sha256 = cfg.get("komuta_cert_sha256") or None
+        pinned_https_fetch(
+            url,
+            body=raw,
+            headers=headers,
+            cert_sha256=cert_sha256,
+            timeout=timeout,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            r.read(256)
 
     def send_heartbeat(self, active_app="", active_game="", agent_ram_mb=0.0, last_samples=None):
         if self._busy_hb:
@@ -334,7 +582,7 @@ class KomutaPusher:
 
         def _work():
             try:
-                self._post(f"{url}/heartbeat", key, payload)
+                self._post(f"{url}/heartbeat", key, payload, cfg=cfg)
             except Exception:
                 pass
             finally:
@@ -345,7 +593,7 @@ class KomutaPusher:
     def send_ingest(self, timeline_events=None):
         if self._busy_ing:
             return
-        url, key, _cfg = self._endpoint()
+        url, key, cfg = self._endpoint()
         if not url or not key:
             return
         bundle = self.store.export_activity_bundle()
@@ -364,7 +612,7 @@ class KomutaPusher:
 
         def _work():
             try:
-                self._post(f"{url}/ingest", key, payload, timeout=15)
+                self._post(f"{url}/ingest", key, payload, timeout=15, cfg=cfg)
                 # Başarılı gönderim sonrası watermark'ı kaydır
                 if tl:
                     try:
@@ -794,8 +1042,17 @@ class ActivityStore:
             self.db.execute("""
                 CREATE TABLE IF NOT EXISTS timeline_watermark (
                     id INTEGER PRIMARY KEY CHECK(id=1),
-                    ts REAL NOT NULL
+                    ts REAL NOT NULL,
+                    last_rowid INTEGER
                 )""")
+            # Migrasyon: varlık DB'lerinde last_rowid kolonu yoksa ekle + taşı (yedek)
+            cols = [r[1] for r in self.db.execute("PRAGMA table_info(timeline_watermark)").fetchall()]
+            if "last_rowid" not in cols:
+                self.db.execute("ALTER TABLE timeline_watermark ADD COLUMN last_rowid INTEGER")
+                # Eski ts değerlerini taşı (tek seferlik)
+                self.db.execute(
+                    "UPDATE timeline_watermark SET last_rowid = CAST(ts AS INTEGER) WHERE last_rowid IS NULL"
+                )
             ver = self.db.execute("PRAGMA user_version").fetchone()[0]
             if ver < 4:
                 self.db.execute("PRAGMA user_version=4")
@@ -1012,8 +1269,8 @@ class ActivityStore:
 
     def get_timeline_watermark(self):
         """Son başarıyla gönderilen timeline olayının rowid'si (başlangıçta 0)."""
-        row = self.db.execute("SELECT ts FROM timeline_watermark WHERE id=1").fetchone()
-        return int(row[0]) if row else 0
+        row = self.db.execute("SELECT last_rowid FROM timeline_watermark WHERE id=1").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
     def set_timeline_watermark(self, event_id):
         """Başarılı ingest sonrası watermark'ı günceller.
@@ -1024,8 +1281,8 @@ class ActivityStore:
         conn = sqlite3.connect(self.path, timeout=5)
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO timeline_watermark(id, ts) VALUES (1, ?)",
-                (int(event_id),)
+                "INSERT OR REPLACE INTO timeline_watermark(id, ts, last_rowid) VALUES (1, ?, ?)",
+                (float(event_id), int(event_id))
             )
             conn.commit()
         finally:
@@ -2851,6 +3108,8 @@ class PCActivityDaemon:
         self.browser = BrowserDomainResolver()
         self.res_sampler = ResourceSampler()
         self.sync = DaemonSync(self.store, self.cfg)
+        # Enrollment: komuta.key yoksa + enroll_code varsa → POST /enroll → cihaz anahtarı al
+        run_enrollment()
         self.komuta = KomutaPusher(self.store, self.cfg)
         self.tray = WinTrayController(self) if IS_WIN else None
         self.stop_requested = False
