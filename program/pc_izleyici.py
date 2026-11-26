@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raven Watch — Hafif Arka Plan Servisi (v4.5.0)
+Raven Watch — Hafif Arka Plan Servisi (v4.6.0)
 
 PySide6 / Qt YÜKLEMEZ! Yalnızca standart kütüphane + psutil + SQLite + Win32/Linux
 yerel çağrılarıyla ~20-25 MB RAM bandında 7/24 sessizce çalışır:
@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
-APP_VERSION = "4.5.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
+APP_VERSION = "4.6.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar
 IS_WIN = sys.platform.startswith("win")
 
 if IS_WIN:
@@ -69,6 +69,7 @@ MACHINE_CONF = os.path.join(CONFIG_DIR, "makine.conf")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "github.token")
 KOMUTA_KEY_PATH = os.path.join(CONFIG_DIR, "komuta.key")
 HUD_STOP_FLAG = os.path.join(DATA_DIR, ".hud_stop")
+HUD_TOGGLE_FLAG = os.path.join(DATA_DIR, ".hud_toggle")
 NOTIFY_FILE = os.path.join(DATA_DIR, ".notify.json")
 
 IDLE_THRESHOLD_SEC = 120.0
@@ -323,6 +324,70 @@ def _build_machine_info(cfg):
         except Exception:
             pass
     return info
+
+
+def request_hud_toggle():
+    """Çalışan Raven Watch servisine HUD aç/kapa sinyali bırakır (Ctrl+Shift+R / CLI)."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(HUD_TOGGLE_FLAG, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        return True
+    except OSError:
+        return False
+
+
+def try_auto_migrate_legacy():
+    """Mevcut legacy komuta.key + HTTP kurulumunu sıfır-dokunuşla cihaz anahtarı + pinned HTTPS'e yükseltir."""
+    existing_key = read_komuta_key()
+    if not existing_key:
+        return False
+    cfg = load_machine_config()
+    if (cfg.get("komuta_cert_sha256") or "").strip():
+        return False
+    komuta_url = (cfg.get("komuta_url") or "").strip().rstrip("/")
+    if not komuta_url:
+        return False
+    machine_id = cfg.get("kimlik") or _slug(platform.node() or "pc")
+    payload = {
+        "machine_id": machine_id,
+        "machine_info": _build_machine_info(cfg),
+    }
+    try:
+        resp = pinned_https_fetch(
+            f"{komuta_url}/migrate-device",
+            body=json.dumps(payload, ensure_ascii=False),
+            headers={"Content-Type": "application/json", "X-Komuta-Key": existing_key},
+            cert_sha256=None,
+            timeout=15,
+        )
+    except Exception:
+        return False
+    if not isinstance(resp, dict):
+        return False
+    new_key = str(resp.get("device_key") or "").strip()
+    if not new_key:
+        return False
+    os.makedirs(os.path.dirname(KOMUTA_KEY_PATH), exist_ok=True)
+    tmp = KOMUTA_KEY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new_key + "\n")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, KOMUTA_KEY_PATH)
+    updates = {}
+    new_pin = str(resp.get("cert_sha256") or "").strip()
+    new_https = str(resp.get("https_url") or "").strip()
+    if new_pin:
+        updates["komuta_cert_sha256"] = new_pin
+    if new_https:
+        updates["komuta_url"] = new_https
+    if updates:
+        save_machine_config(updates)
+    print(f"[pc_izleyici] sıfır-dokunuş cihaz geçişi tamamlandı: {machine_id}", file=sys.stderr)
+    return True
 
 
 def run_enrollment():
@@ -2748,7 +2813,13 @@ if IS_WIN:
     WM_DESTROY = 0x0002
     WM_CLOSE = 0x0010
     WM_COMMAND = 0x0111
+    WM_HOTKEY = 0x0312
     WM_USER = 0x0400
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_NOREPEAT = 0x4000
+    VK_R = 0x52
+    HOTKEY_HUD_ID = 0x5257
     WM_TRAY = WM_USER + 20
     WM_LBUTTONDBLCLK = 0x0203
     WM_RBUTTONUP = 0x0205
@@ -2944,6 +3015,10 @@ if IS_WIN:
             ]
             self._u32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
             self._u32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+            self._u32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+            self._u32.RegisterHotKey.restype = ctypes.c_int
+            self._u32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self._u32.UnregisterHotKey.restype = ctypes.c_int
             self._s32.Shell_NotifyIconW.argtypes = [ctypes.c_uint, ctypes.POINTER(NOTIFYICONDATAW)]
 
         def start(self):
@@ -2956,6 +3031,9 @@ if IS_WIN:
             self._u32.RegisterClassW(ctypes.byref(wc))
             self.hwnd = self._u32.CreateWindowExW(
                 0, cls_name, "Raven Watch Servis", 0, 0, 0, 0, 0, None, None, hinst, None
+            )
+            self._hotkey_ok = bool(
+                self._u32.RegisterHotKey(self.hwnd, HOTKEY_HUD_ID, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_R)
             )
             self.hicon = _create_tray_hicon()
             self._nid = NOTIFYICONDATAW()
@@ -3003,7 +3081,7 @@ if IS_WIN:
             self._u32.AppendMenuW(menu, MF_STRING, self.CMD_WEB_KOMUTA, "🌐 Raven Watch Web (serhatbahar.com/komuta)")
             self._u32.AppendMenuW(
                 menu, MF_STRING, self.CMD_TOGGLE_HUD,
-                "🎮 Canlı Oyun HUD'unu Kapat" if hud_on else "🎮 Canlı Oyun HUD'unu Aç",
+                "🎮 Canlı Oyun HUD'unu Kapat (Ctrl+Shift+R)" if hud_on else "🎮 Canlı Oyun HUD'unu Aç (Ctrl+Shift+R)",
             )
             self._u32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             self._u32.AppendMenuW(
@@ -3031,6 +3109,10 @@ if IS_WIN:
             self._u32.DestroyMenu(menu)
 
         def _proc(self, hwnd, msg, wp, lp):
+            if msg == WM_HOTKEY:
+                if (wp & 0xFFFF) == HOTKEY_HUD_ID:
+                    self.daemon.toggle_hud_manual()
+                return 0
             if msg == WM_TRAY:
                 ev = lp & 0xFFFF
                 if ev == WM_RBUTTONUP:
@@ -3093,6 +3175,8 @@ if IS_WIN:
         def cleanup(self):
             if self.hwnd:
                 try:
+                    if getattr(self, "_hotkey_ok", False):
+                        self._u32.UnregisterHotKey(self.hwnd, HOTKEY_HUD_ID)
                     self._s32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
                     self._u32.DestroyWindow(self.hwnd)
                 except Exception:
@@ -3114,8 +3198,10 @@ class PCActivityDaemon:
         self.browser = BrowserDomainResolver()
         self.res_sampler = ResourceSampler()
         self.sync = DaemonSync(self.store, self.cfg)
-        # Enrollment: komuta.key yoksa + enroll_code varsa → POST /enroll → cihaz anahtarı al
+        # Enrollment / sıfır-dokunuş geçiş: legacy veya enroll_code varsa cihaz anahtarına geçir
         run_enrollment()
+        try_auto_migrate_legacy()
+        self.cfg = load_machine_config()
         self.komuta = KomutaPusher(self.store, self.cfg)
         self.tray = WinTrayController(self) if IS_WIN else None
         self.stop_requested = False
@@ -3150,6 +3236,7 @@ class PCActivityDaemon:
         # Çocuk HUD & Dashboard süreç yönetimi
         self._hud_proc = None
         self._hud_auto_launched = False
+        self._hud_suppressed_until_game_ends = False
         self._dash_proc = None
         self._last_game_seen_ts = 0.0
         self._current_label = "Hazır"
@@ -3219,8 +3306,10 @@ class PCActivityDaemon:
 
     def toggle_hud_manual(self):
         if self.is_hud_running():
+            self._hud_suppressed_until_game_ends = True
             self.stop_hud()
         else:
+            self._hud_suppressed_until_game_ends = False
             self.ensure_hud_running(auto=False)
 
     def launch_dashboard(self, extra_args=None):
@@ -3357,10 +3446,15 @@ class PCActivityDaemon:
             self._last_game_seen_ts = now
             if is_game:
                 self._last_game_name = app_name
-            if self.cfg.get("hud_oto", "acik") != "kapali" and not self.is_hud_running():
+            if (
+                self.cfg.get("hud_oto", "acik") != "kapali"
+                and not getattr(self, "_hud_suppressed_until_game_ends", False)
+                and not self.is_hud_running()
+            ):
                 self.ensure_hud_running(auto=True)
         elif now - self._last_game_seen_ts > HUD_IDLE_GRACE_SEC:
             self._last_game_name = ""
+            self._hud_suppressed_until_game_ends = False
 
     def _check_auto_hud(self, now):
         if self.cfg.get("hud_hep_acik", "kapali") == "acik":
@@ -3439,6 +3533,12 @@ class PCActivityDaemon:
 
     def step(self):
         now = time.time()
+        if os.path.isfile(HUD_TOGGLE_FLAG):
+            try:
+                os.remove(HUD_TOGGLE_FLAG)
+            except OSError:
+                pass
+            self.toggle_hud_manual()
         if now >= self._next_poll:
             self._next_poll = now + POLL_ACTIVE_SEC
             self._poll_active(now)

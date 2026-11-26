@@ -215,11 +215,25 @@ if [[ -n "${OI_KOMUTA_URL:-}" ]]; then
     echo "komuta_url = ${OI_KOMUTA_URL}" >> "$CONF_DIR/makine.conf.tmp"
     mv "$CONF_DIR/makine.conf.tmp" "$CONF_DIR/makine.conf"
 fi
+_CERT_PIN="${OI_CERT_SHA256:-}"
+if [[ -z "$_CERT_PIN" && "${OI_KOMUTA_URL:-}" == https://192.168.1.13/* ]]; then
+    _CERT_PIN="c99a9a2d26ac19fc6fcf950b3cc6b06baaadf6edc81ff81f25c23078e130bb84"
+fi
+if [[ -n "$_CERT_PIN" ]]; then
+    grep -v '^komuta_cert_sha256' "$CONF_DIR/makine.conf" 2>/dev/null > "$CONF_DIR/makine.conf.tmp" || true
+    echo "komuta_cert_sha256 = ${_CERT_PIN}" >> "$CONF_DIR/makine.conf.tmp"
+    mv "$CONF_DIR/makine.conf.tmp" "$CONF_DIR/makine.conf"
+fi
+if [[ -n "${OI_ENROLL:-}" ]]; then
+    grep -v '^enroll_code' "$CONF_DIR/makine.conf" 2>/dev/null > "$CONF_DIR/makine.conf.tmp" || true
+    echo "enroll_code = ${OI_ENROLL}" >> "$CONF_DIR/makine.conf.tmp"
+    mv "$CONF_DIR/makine.conf.tmp" "$CONF_DIR/makine.conf"
+fi
 if [[ -n "${OI_KOMUTA_KEY:-}" ]]; then
     printf '%s\n' "$OI_KOMUTA_KEY" > "$CONF_DIR/komuta.key"
     chmod 600 "$CONF_DIR/komuta.key"
 fi
-say "Uygulama menüsü ve otomatik başlatma"
+say "Uygulama menüsü, Ctrl+Shift+R HUD kısayolu ve otomatik başlatma"
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config/autostart"
 write_desktop() {  # $1 = hedef dosya, $2 = Exec satırı, $3 = ek satırlar
     cat > "$1" <<EOF
@@ -237,6 +251,20 @@ EOF
 write_desktop "$HOME/.local/share/applications/oyun-izleyici.desktop" "$HOME/.local/bin/oyun-izleyici" ""
 write_desktop "$HOME/.config/autostart/oyun-izleyici.desktop" \
     "sh -c \"sleep 5; exec $HOME/.local/bin/oyun-izleyici\"" "X-KDE-autostart-phase=2"
+cat > "$HOME/.local/share/applications/raven-watch-toggle.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Raven Watch HUD Aç/Kapat
+Comment=Oyundayken Raven Watch HUD panelini açar veya kapatır (Ctrl+Shift+R)
+Exec=$HOME/.local/bin/oyun-izleyici --toggle-hud
+Icon=utilities-system-monitor
+Terminal=false
+NoDisplay=true
+EOF
+if command -v kwriteconfig6 >/dev/null 2>&1; then
+    kwriteconfig6 --file kglobalshortcutsrc --group "services" --group "raven-watch-toggle.desktop" --key "_launch" "Ctrl+Shift+R" 2>/dev/null || true
+    kwriteconfig6 --file kglobalshortcutsrc --group "services" --group "raven-watch-toggle.desktop" --key "_k_friendly_name" "Raven Watch HUD Aç/Kapat" 2>/dev/null || true
+fi
 
 # --- 6. Yeniden başlat ---------------------------------------------------------
 if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" && -n "$shell_pid" && -r "/proc/$shell_pid/environ" ]]; then

@@ -5,7 +5,7 @@ Oyun oynarken canlı **FPS, 1% / 0.1% low, frametime, GPU / CPU / RAM** değerle
 - **Linux** (CachyOS / Arch tabanlı, AMD · NVIDIA · Intel): FPS için [MangoHud](https://github.com/flightlessmango/MangoHud) kayıtları, sensörler için `/sys` ve `/proc`.
 - **Windows 10/11** (NVIDIA / Intel / AMD): FPS için Intel'in [PresentMon](https://github.com/GameTechDev/PresentMon)'u, sensörler için `psutil`, `nvidia-smi` ve WMI.
 
-> **Sürüm:** `v4.5.0` — İki süreçli hafif mimari (7/24 ~15–20 MB tepsi servisi + oyun açılınca otomatik HUD), cihaz-başına anahtar enrollment, pinned LAN TLS ve SHA-256 doğrulamalı GitHub Release güncelleyici.
+> **Sürüm:** `v4.6.0` — İki süreçli hafif mimari (7/24 ~15–20 MB tepsi servisi + oyun açılınca otomatik HUD, **oyundayken `Ctrl+Shift+R` ile HUD aç/kapa**), tek tık **`RavenWatch-Setup.exe`**, sıfır-dokunuş cihaz geçişi + otomatik legacy kapanışı, pinned LAN TLS ve SHA-256 doğrulamalı GitHub Release güncelleyici.
 
 ## Özellikler
 - Dikey HUD paneli (taşınır, boyutlanır, saydamlaşır, tema rengi ya da KDE "Edna" temasıyla uyumlu hazır tema); üstte saat ve tarih şeridi; tek ekranda sadece tepsi simgesi.
@@ -25,12 +25,11 @@ bash kur.sh "PC Adı"
 ```
 Güncellemek için `git pull && bash kur.sh`.
 
-### Windows
-1. Depoyu indir (**Code → Download ZIP**) ya da `git clone`.
-2. `kur.bat` dosyasına çift tıkla (ya da `powershell -ExecutionPolicy Bypass -File kur.ps1 -PcAdi "Laptop"`).
-3. Betik Python'u (yoksa winget ile), PySide6 / psutil'i ve **sabit sürüm + SHA256 doğrulamalı** PresentMon'u kurar; Başlat menüsü ve otomatik başlatma kısayolu ekler.
-4. PresentMon'un yönetici olmadan çalışması için kullanıcıyı **Performance Log Users** grubuna ekler (bir kez UAC sorar). Sonrasında **Windows oturumunu kapatıp aç**.
-5. Sorun olursa `%LOCALAPPDATA%\oyun-izleyici\tani.bat` sensörleri ve PresentMon'u dener.
+### Windows (Tek Tık Kurulum)
+1. [Releases sayfasından](https://github.com/cdokuro/oyun-izleyici/releases/latest) **`RavenWatch-Setup.exe`** indirip çift tıkla ve **"Kur ve Başlat"** de — başka hiçbir manuel adım gerekmez!
+2. Alternatif (PowerShell tek satır): `irm https://raw.githubusercontent.com/cdokuro/oyun-izleyici/main/kur.ps1 | iex`
+3. Oyundayken HUD'u istediğin an açıp kapatmak için **`Ctrl+Shift+R`** bas.
+4. Sorun olursa `%LOCALAPPDATA%\oyun-izleyici\tani.bat` sensörleri ve PresentMon'u dener.
 
 ## Ayarlar (`makine.conf`)
 Linux: `~/.config/oyun-izleyici/makine.conf` · Windows: `%APPDATA%\oyun-izleyici\makine.conf`

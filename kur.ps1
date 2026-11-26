@@ -242,16 +242,31 @@ if ($KayitDeposu) {
 }
 
 # ---- 9. Baslat ---------------------------------------------------------------------
+$kConf = Join-Path $Roam "makine.conf"
+$confUpdates = @{}
 if ($env:OI_KOMUTA_URL) {
-    $kConf = Join-Path $Roam "makine.conf"
-    $kLines = if (Test-Path $kConf) { Get-Content $kConf } else { @() }
-    $kLines = @($kLines | Where-Object { $_ -notmatch '^\s*komuta_url\s*=' }) + ("komuta_url = " + $env:OI_KOMUTA_URL)
-    Set-Content -Path $kConf -Value $kLines -Encoding UTF8
+    $confUpdates["komuta_url"] = $env:OI_KOMUTA_URL.Trim()
+}
+if ($env:OI_CERT_SHA256) {
+    $confUpdates["komuta_cert_sha256"] = $env:OI_CERT_SHA256.Trim()
+} elseif ($env:OI_KOMUTA_URL -and $env:OI_KOMUTA_URL -match '^https://192\.168\.1\.13/') {
+    $confUpdates["komuta_cert_sha256"] = "c99a9a2d26ac19fc6fcf950b3cc6b06baaadf6edc81ff81f25c23078e130bb84"
+}
+if ($env:OI_ENROLL) {
+    $confUpdates["enroll_code"] = $env:OI_ENROLL.Trim()
+}
+if ($confUpdates.Count -gt 0) {
+    $kLines = if (Test-Path $kConf) { @(Get-Content $kConf) } else { @("[makine]") }
+    foreach ($kv in $confUpdates.GetEnumerator()) {
+        $pat = '^\s*' + [regex]::Escape($kv.Key) + '\s*='
+        $kLines = @($kLines | Where-Object { $_ -notmatch $pat }) + ($kv.Key + " = " + $kv.Value)
+    }
+    [System.IO.File]::WriteAllText($kConf, ($kLines -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 if ($env:OI_KOMUTA_KEY) {
-    Set-Content -Path (Join-Path $Roam "komuta.key") -Value $env:OI_KOMUTA_KEY -Encoding UTF8 -NoNewline
+    [System.IO.File]::WriteAllText((Join-Path $Roam "komuta.key"), $env:OI_KOMUTA_KEY.Trim() + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
-Say "Raven Watch baslatiliyor"
+Say "Raven Watch baslatiliyor (Oyunda HUD ac/kapa: Ctrl+Shift+R)"
 Start-Process -FilePath $VenvPyW -ArgumentList ('"' + $AppFile + '"') -WorkingDirectory $Data
 
 Write-Host ""

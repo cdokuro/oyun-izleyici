@@ -18,7 +18,7 @@ import time
 import math
 from collections import deque
 
-APP_VERSION = "4.5.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar (v4.5.0: Raven Watch + cila)
+APP_VERSION = "4.6.0"  # MAJOR.MINOR.PATCH — güncelleme rozeti yalnızca MAJOR veya MINOR yükselince çıkar (v4.6.0: Ctrl+Shift+R + sıfır-dokunuş kurulum)
 
 IS_WIN = sys.platform.startswith("win")
 if IS_WIN:
@@ -36,6 +36,16 @@ else:
 # ~20 MB RAM ile 7/24 çalışan pc_izleyici arka plan servisini başlatır.
 # =============================================================================
 _UI_FLAGS = {"--hud", "--dashboard", "--rapor", "--sync", "--tani", "--snapshot", "--eski", "--auto-hud", "--deps-check"}
+if __name__ == "__main__" and "--toggle-hud" in sys.argv:
+    _app_dir = os.path.dirname(os.path.abspath(__file__))
+    if _app_dir not in sys.path:
+        sys.path.insert(0, _app_dir)
+    try:
+        import pc_izleyici as _pci
+        _pci.request_hud_toggle()
+    except Exception:
+        pass
+    sys.exit(0)
 if __name__ == "__main__" and not (set(sys.argv[1:]) & _UI_FLAGS):
     _app_dir = os.path.dirname(os.path.abspath(__file__))
     _daemon_local = os.path.join(_app_dir, "pc_izleyici.py")
@@ -5000,8 +5010,14 @@ class HudWindow(QWidget):
         if not self.daemon_managed:
             self._setup_tray()
 
-        self.setWindowTitle("Canlı Oyun & Donanım İzleyici")
+        self.setWindowTitle("Raven Watch — Canlı Oyun HUD")
         self._apply_window_flags()
+        try:
+            from PySide6.QtGui import QKeySequence, QShortcut
+            self._sc_toggle = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
+            self._sc_toggle.activated.connect(self.close)
+        except Exception:
+            pass
         self.resize(int(self.base_w * self.scale_factor), int(self.base_h * self.scale_factor))
         saved_pos = self.settings.value("pos", None, type=QPoint)
         if saved_pos is not None and QGuiApplication.screenAt(saved_pos + QPoint(20, 20)) is not None:
