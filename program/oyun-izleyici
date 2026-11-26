@@ -769,14 +769,15 @@ class SessionStore:
         if not game:
             return 0.0
         mid = machine or self.machine_id
-        if exclude_log:
+        ex = os.path.basename(exclude_log) if exclude_log else ""
+        if ex:
             row = self.db.execute(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND game=? AND log_file<>?",
-                (mid, game, exclude_log),
+                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND LOWER(game)=LOWER(?) AND log_file<>?",
+                (mid, game, ex),
             ).fetchone()
         else:
             row = self.db.execute(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND game=?",
+                "SELECT COALESCE(SUM(duration_s), 0) FROM sessions WHERE machine_id=? AND LOWER(game)=LOWER(?)",
                 (mid, game),
             ).fetchone()
         return float(row[0] or 0.0) if row else 0.0
@@ -6296,18 +6297,18 @@ class HudWindow(QWidget):
             p.setPen(green)
             total_pc_line = ""
             if sm:
-                sub_footer = f"BİTTİ · {fmt_duration(sm['duration_s'], True)}"
+                sub_footer = f"Bitti (Oturum) · {fmt_duration(sm['duration_s'], True)}"
                 if sm.get("total_secs"):
-                    total_pc_line = f"TOPLAM OYUN SÜRESİ · {fmt_duration(sm['total_secs'])}"
+                    total_pc_line = f"Toplam Oyun Süresi · {fmt_duration(sm['total_secs'])}"
             elif t.game_name:
                 sess_sec = max(0.0, time.time() - t.session.start_ts) if t.session else 0.0
                 if sess_sec <= 0 and t.session:
                     sess_sec = t.session.duration()
                 timer_str = fmt_clock_timer(sess_sec)
                 if t.fps is None:
-                    sub_footer = f"DURAKLATILDI · {timer_str}"
+                    sub_footer = f"Duraklatıldı (Oturum) · {timer_str}"
                 else:
-                    sub_footer = f"BU OTURUM · {timer_str}"
+                    sub_footer = f"Oyun Süresi (Oturum) · {timer_str}"
                 past_sec = 0.0
                 if self.store is not None:
                     cur_log = getattr(t.session, "log_file", "") or ""
@@ -6321,7 +6322,7 @@ class HudWindow(QWidget):
                         self._game_total_cache = (t.game_name, cur_log, csec, now_t)
                     past_sec = csec
                 total_pc_sec = past_sec + sess_sec
-                total_pc_line = f"TOPLAM OYUN SÜRESİ · {fmt_duration(total_pc_sec)}"
+                total_pc_line = f"Toplam Oyun Süresi · {fmt_duration(total_pc_sec)}"
             else:
                 sub_footer = f"OTURUM SÜRESİ · {fmt_clock_timer(read_system_uptime())}"
             if total_pc_line:
