@@ -6298,16 +6298,16 @@ class HudWindow(QWidget):
             if sm:
                 sub_footer = f"BİTTİ · {fmt_duration(sm['duration_s'], True)}"
                 if sm.get("total_secs"):
-                    total_pc_line = f"BU PC TOPLAM · {fmt_duration(sm['total_secs'])}"
+                    total_pc_line = f"TOPLAM OYUN SÜRESİ · {fmt_duration(sm['total_secs'])}"
             elif t.game_name:
                 sess_sec = max(0.0, time.time() - t.session.start_ts) if t.session else 0.0
                 if sess_sec <= 0 and t.session:
                     sess_sec = t.session.duration()
                 timer_str = fmt_clock_timer(sess_sec)
                 if t.fps is None:
-                    sub_footer = f"OYUN DURAKLATILDI · {timer_str}"
+                    sub_footer = f"DURAKLATILDI · {timer_str}"
                 else:
-                    sub_footer = f"OYUN SÜRESİ · {timer_str}"
+                    sub_footer = f"BU OTURUM · {timer_str}"
                 past_sec = 0.0
                 if self.store is not None:
                     cur_log = getattr(t.session, "log_file", "") or ""
@@ -6321,7 +6321,7 @@ class HudWindow(QWidget):
                         self._game_total_cache = (t.game_name, cur_log, csec, now_t)
                     past_sec = csec
                 total_pc_sec = past_sec + sess_sec
-                total_pc_line = f"BU PC TOPLAM · {fmt_duration(total_pc_sec)}"
+                total_pc_line = f"TOPLAM OYUN SÜRESİ · {fmt_duration(total_pc_sec)}"
             else:
                 sub_footer = f"OTURUM SÜRESİ · {fmt_clock_timer(read_system_uptime())}"
             if total_pc_line:
